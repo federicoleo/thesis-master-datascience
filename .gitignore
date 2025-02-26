@@ -193,3 +193,6 @@ pyrightconfig.json
 
 ### Custom ###
 wandb/
+
+### TEST ###
+testing.py
