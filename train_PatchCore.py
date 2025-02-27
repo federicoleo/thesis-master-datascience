@@ -87,55 +87,27 @@ class PatchCore(torch.nn.Module):
         # [num_samples, 1536, 128, 128]
         
         N, C, H, W = self.memory_bank.shape
-        patch_embeddings = self.memory_bank.permute(0, 2, 3, 1).reshape(-1, C)  # [N*H*W, C]
-    
-        # Apply random projection for dimensionality reduction (Johnson-Lindenstrauss)
-        n_samples = patch_embeddings.shape[0]
-        epsilon = 0.1  # Error tolerance
-        
-        # Calculate reduced dimension d* based on Johnson-Lindenstrauss lemma
-        # The formula is derived from ensuring epsilon-distortion with high probability
-        d_star = min(
-            C,  # Can't project to higher dimension
-            int(4 * np.log(n_samples) / (epsilon**2/2 - epsilon**3/3))  # ~O(log N)
-        )
-        # d_star = 128  # Set a fixed value for testing
-        print(f"Projecting from {C} to {d_star} dimensions")
-
-        # Create random projection matrix
-        torch.manual_seed(0)  # For reproducibility
-        
-        projection_matrix = torch.randn(C, d_star).to(patch_embeddings.device)
-        #  matrix [C, d_star] with random values from a standard normal distribution
-        
-        projection_matrix = projection_matrix / torch.sqrt(torch.sum(projection_matrix**2, dim=0, keepdim=True))
-        # Normalize the projection matrix (l2 norm with the sqrt)
-
-        # Apply projection
-        # We multiply our patch embeddings with the projection matrix
-        projected_embeddings = torch.matmul(patch_embeddings, projection_matrix)  # [N*H*W, d_star]
-        # we multiply our patch embeddings with the projection matrix
-        # relative distances between points are approximately preserved (that's the key benefit of Johnson-Lindenstrauss projection)
+        print(f"Memory bank created with {N} samples of shape {C}x{H}x{W}")
         
         # Apply coreset sampling
         share = 0.01  # Keep 1% of all patches (adjust based on your needs)
         target_samples = max(1000, int(N * H * W * share))
-        
-        # Initialize and run CoresetSampler
-        sampler = CoresetSampler(
-            n_samples=target_samples,
-            device=patch_embeddings.device,
-            tqdm_disable=False,
-            verbose=1
+
+        selected_embeddings, selected_indices = coreset_subsampling(
+             embeddings=self.memory_bank,
+             target_samples=target_samples,
+             epsilon=0.1,
+             device=self.device,
+             use_projection=True
         )
-        
-        # Sample the most representative patches
-        coreset_idx = sampler.sample(projected_embeddings.cpu().numpy())
-        
-        # Keep only the sampled patch embeddings from the original space (not the projected space)
-        self.memory_bank = patch_embeddings[coreset_idx]  # [target_samples, C]
-        
-        print(f"Memory bank reduced from {N*H*W} to {len(coreset_idx)} patch embeddings")
+
+        self.memory_bank = selected_embeddings
+
+        print(f"Memory bank reduced from {N*H*W} to {len(selected_indices)} patch embeddings via coreset subsampling")
+
+        # Save memory bank to disk
+        # with open("memory_bank.pkl", "wb") as f:
+        #     pickle.dump(self.memory_bank, f)
 
     def evaluate(self, test_dataloader : DataLoader):
         "anomaly detection"
@@ -143,6 +115,7 @@ class PatchCore(torch.nn.Module):
 
     def predict(self, sample):
         pass
+
 
 def local_neighborhood_aggregation(feature_map, p=3):
     """
@@ -205,56 +178,133 @@ def bilinear_upsample(lower_spatial_block, target_size):
     else:
         return F.interpolate(lower_spatial_block, size=target_size, mode='bilinear', align_corners=False)
 
-def random_linear_projections(memory_bank: torch.Tensor, d_star: int) -> torch.Tensor:
+
+def random_projection(embeddings, target_dim, epsilon=0.1, seed=0):
     """
-    Applies JL projection to feature dimension while preserving spatial structure.
-    Input: [N, 1536, H, W]
-    Output: [N, d_star, H, W]
+    Applies random projection to reduce embedding dimensionality using Johnson-Lindenstrauss lemma.
+    
+    Args:
+        embeddings (torch.Tensor): Input embeddings of shape [N, C]
+        target_dim (int): Target dimension to project to
+        epsilon (float): Error tolerance for distance preservation
+        seed (int): Random seed for reproducibility
+        
+    Returns:
+        torch.Tensor: Projected embeddings of shape [N, target_dim]
     """
-    device = memory_bank.device
-    N, C, H, W = memory_bank.shape
+    # Get original dimensions
+    N, C = embeddings.shape
     
-    # Generate projection matrix once (shared across all spatial positions)
-    projection_matrix = torch.randn(C, d_star, device=device) / np.sqrt(d_star)
+    # Set random seed for reproducibility
+    torch.manual_seed(seed)
     
-    # Project features at every spatial position
-    projected = torch.einsum('nchw,cd->ndhw', memory_bank, projection_matrix)
-    return projected  # Shape: [N, d_star, H, W]
-
-
-
-def coreset_subsampling(memory_bank, coreset_target_size):
-    # greedy approach
-    B, C, H, W = memory_bank.shape
+    # Create random projection matrix
+    projection_matrix = torch.randn(C, target_dim, device=embeddings.device)
     
-    features = memory_bank.view(C, H * W).T
-
-    features_np = features.cpu().detach().numpy()
-
-    N, _ = features_np.shape
-    num_samples = coreset_target_size*N
-
-    selected_indices = [0]  # Start with the first point
-    distances = np.full(N, np.inf)
-
-    # Greedily select points that maximize the minimum distance to the current centers
-    for _ in range(1, num_samples):
-        last_center = features_np[selected_indices[-1]]
-        # Compute Euclidean distances from the last center to all points
-        dist_to_last = np.linalg.norm(features_np - last_center, axis=1)
-        # Update each point's distance to its closest center so far
-        distances = np.minimum(distances, dist_to_last)
-        # Select the point with the maximum distance to its nearest center
-        next_index = np.argmax(distances)
-        selected_indices.append(next_index)
-
-    # Retrieve the selected feature vectors and convert back to a torch tensor
-    centers_np = features_np[selected_indices]
-    centers = torch.tensor(centers_np, device=memory_bank.device, dtype=memory_bank.dtype)
-    return centers
+    
+    # Normalize columns to ensure distance preservation properties
+    # Normalize the projection matrix (l2 norm with the sqrt)
+    projection_matrix = projection_matrix / torch.sqrt(torch.sum(projection_matrix**2, dim=0, keepdim=True))
+    
+    # Apply projection
+    # we multiply our patch embeddings with the projection matrix
+    # relative distances between points are approximately preserved (that's the key benefit of Johnson-Lindenstrauss projection)
+    projected = torch.matmul(embeddings, projection_matrix)
+    
+    return projected
 
 
+def calculate_projection_dim(n_samples, original_dim, epsilon=0.1):
+    """
+    Calculate the minimum dimension needed for projection according to Johnson-Lindenstrauss lemma.
+    
+    Args:
+        n_samples (int): Number of samples in the dataset
+        original_dim (int): Original feature dimension
+        epsilon (float): Desired error bound (typically 0.1-0.3)
+        
+    Returns:
+        int: Target dimension for projection
+    """
+    # JL lemma formula for the minimum dimension
+    # Calculate reduced dimension d* based on Johnson-Lindenstrauss lemma
+    # The formula is derived from ensuring epsilon-distortion with high probability
+    jl_dim = int(4 * np.log(n_samples) / (epsilon**2/2 - epsilon**3/3))
+    
+    # Can't project to higher dimension than original
+    return min(original_dim, jl_dim)
 
+
+def coreset_subsampling(embeddings, target_samples, epsilon=0.1, device=None, use_projection=True):
+    """
+    Applies coreset subsampling to select representative embeddings.
+    
+    Args:
+        embeddings (torch.Tensor): Input embeddings of shape [N, C] or [N, C, H, W]
+        target_samples (int): Number of samples to select
+        epsilon (float): Error tolerance for random projection
+        device (str): Device to use for computation
+        use_projection (bool): Whether to apply random projection
+        
+    Returns:
+        torch.Tensor: Selected embeddings
+        list: Indices of selected embeddings
+    """
+    
+    # Determine device
+    if device is None:
+        device = embeddings.device
+    
+    # Handle different input shapes
+    original_shape = embeddings.shape
+    if len(original_shape) > 2:
+        # For feature maps [N, C, H, W], reshape to [N*H*W, C]
+        N, C, H, W = embeddings.shape
+        reshaped_embeddings = embeddings.permute(0, 2, 3, 1).reshape(-1, C)
+    else:
+        # Already in correct shape [N, C]
+        reshaped_embeddings = embeddings
+    
+    n_samples, C = reshaped_embeddings.shape
+    
+    # Step 1: Apply random projection if requested and beneficial
+    if use_projection and C > 10:  # Only project if dimension is substantial
+        # Calculate target projection dimension
+        d_star = calculate_projection_dim(n_samples, C, epsilon)
+        # d_star = 128
+        
+        # Apply projection if it reduces dimension
+        if d_star < C:
+            print(f"Projecting from {C} to {d_star} dimensions")
+            embeddings_for_sampling = random_projection(reshaped_embeddings, d_star, epsilon)
+        else:
+            print(f"Skipping projection as calculated dimension {d_star} ≥ original {C}")
+            embeddings_for_sampling = reshaped_embeddings
+    else:
+        # Skip projection
+        embeddings_for_sampling = reshaped_embeddings
+    
+    # Step 2: Apply coreset sampling
+    # Ensure we don't try to select more samples than available
+    target_samples = min(target_samples, n_samples)
+    
+    # Initialize and run sampler
+    sampler = CoresetSampler(
+        n_samples=target_samples,
+        device=str(device),
+        tqdm_disable=False,
+        verbose=1
+    )
+    
+    # Get indices of selected samples
+    selected_indices = sampler.sample(embeddings_for_sampling.cpu().numpy())
+    
+    # Step 3: Return selected embeddings in original space
+    selected_embeddings = reshaped_embeddings[selected_indices]
+    
+    print(f"Reduced from {n_samples} to {len(selected_indices)} samples")
+    
+    return selected_embeddings, selected_indices
 
 if __name__ == '__main__':
     print("Testing PatchCore model")
