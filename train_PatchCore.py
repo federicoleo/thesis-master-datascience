@@ -6,24 +6,30 @@
 import logging
 import os
 import pickle # to be used with mvtec images
-import tqdm
+from tqdm import tqdm
 
 import numpy as np
 import torch
+
 import torchvision.models as models
 import torch.nn.functional as F
 from torchvision.models import ResNet50_Weights
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
-from sklearn.random_projection import GaussianRandomProjection
 from DiversitySampling.src.coreset import CoresetSampler
+from torchvision import transforms
+from PIL import ImageFilter
+from torch import tensor
+from sklearn.metrics import roc_auc_score
 
 LOGGER = logging.getLogger(__name__)
 
 class PatchCore(torch.nn.Module):
     def __init__(self):
         super(PatchCore, self).__init__()
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cuda" if torch.cuda.is_available() else "mps"
+        self.k_nearest = 3
+        self.image_size = (224, 224)
         self.extracted_features = []
         self.memory_bank = []
         
@@ -42,17 +48,17 @@ class PatchCore(torch.nn.Module):
             param.requires_grad = False
 
     def forward(self, sample):
-
+            self.extracted_features = []
             _ = self.model(sample)
 
             return self.extracted_features
 
 
-    def fit(self, train_dataloader : DataLoader):
+    def fit(self, dataloader : DataLoader):
         
         memory_items = []
 
-        for sample, _ in tqdm(train_dataloader, total=len(train_dataloader)):
+        for sample, _ in tqdm(dataloader, total=len(dataloader)):
             # Extract features for the current batch
             self.extracted_features = []
             _ = self.model(sample)
@@ -77,28 +83,29 @@ class PatchCore(torch.nn.Module):
                 ], dim=0)  # Result: [1536, H2, W2]
                 
                 # Resize to target dimension
-                resized = bilinear_upsample(combined.unsqueeze(0), target_size=(128, 128)).squeeze(0)
+                resized = bilinear_upsample(combined.unsqueeze(0), target_size=(28, 28)).squeeze(0)
                 
                 # Add to memory items collection
                 memory_items.append(resized.unsqueeze(0))
 
 
         self.memory_bank = torch.cat(memory_items, dim=0)
-        # [num_samples, 1536, 128, 128]
+        # [num_samples, 1536, 28, 28]
         
         N, C, H, W = self.memory_bank.shape
         print(f"Memory bank created with {N} samples of shape {C}x{H}x{W}")
         
+
         # Apply coreset sampling
         share = 0.01  # Keep 1% of all patches (adjust based on your needs)
         target_samples = max(1000, int(N * H * W * share))
 
         selected_embeddings, selected_indices = coreset_subsampling(
-             embeddings=self.memory_bank,
-             target_samples=target_samples,
-             epsilon=0.1,
-             device=self.device,
-             use_projection=True
+            embeddings=self.memory_bank,
+            target_samples=target_samples,
+            epsilon=0.1,
+            device=self.device,
+            use_projection=True
         )
 
         self.memory_bank = selected_embeddings
@@ -109,12 +116,81 @@ class PatchCore(torch.nn.Module):
         # with open("memory_bank.pkl", "wb") as f:
         #     pickle.dump(self.memory_bank, f)
 
-    def evaluate(self, test_dataloader : DataLoader):
-        "anomaly detection"
-        pass
+    def evaluate(self, test_dataloader: DataLoader):
+        """
+            Compute anomaly detection score and relative segmentation map for
+            each test sample. Returns the ROC AUC computed from predictions scores.
+
+            Returns:
+            - image-level ROC-AUC score
+            - pixel-level ROC-AUC score
+        """
+
+        image_preds = []
+        image_labels = []
+        pixel_preds = []
+        pixel_labels = []
+
+        for sample, mask, label in tqdm(test_dataloader):
+
+            image_labels.append(label)
+            pixel_labels.extend(mask.flatten().numpy())
+
+            score, segm_map = self.predict(sample)  # Anomaly Detection
+
+            image_preds.append(score.numpy())
+            pixel_preds.extend(segm_map.flatten().numpy())
+
+        image_labels = np.stack(image_labels)
+        image_preds = np.stack(image_preds)
+
+        # Compute ROC AUC for prediction scores
+        image_level_rocauc = roc_auc_score(image_labels, image_preds)
+        pixel_level_rocauc = roc_auc_score(pixel_labels, pixel_preds)
+
+        return image_level_rocauc, pixel_level_rocauc
 
     def predict(self, sample):
-        pass
+        # Patch Extraction
+        
+        # Get features through forward method
+        feature_maps = self(sample)
+        # Local Neighborhood Aggregation
+        feature_maps = [local_neighborhood_aggregation(fm, p=3) for fm in feature_maps]
+        # Matching Feature Dimensions
+        feature_maps[1] = bilinear_upsample(feature_maps[1], target_size=feature_maps[0].shape[2:])
+        # Concatenation and Resizing
+        patch_collection = torch.cat(feature_maps, dim=1)
+        patch_collection = patch_collection.reshape(patch_collection.shape[1], -1).T
+        
+        # Calculate distances
+        distances = torch.cdist(patch_collection, self.memory_bank, p=2.0) # Shape: (784, N_subsampled×28×28)
+        # Get the minimum distance for each patch
+        dist_score, dist_score_idx = torch.min(distances, dim=1) # minimum distance for each patch
+        s_idx = torch.argmax(dist_score) # index of the patch with the maximum distance
+        s_star = torch.max(dist_score) # maximum distance, RAW ANOMALY SCORE
+        
+        m_test_star = patch_collection[s_idx] # feature vector of the most anomalous patch, actual embedding of the most anomalous patch
+        m_star = self.memory_bank[dist_score_idx[s_idx]].unsqueeze(0) # embedding of the nearest neighbor of the most anomalous patch
+
+        # KNN
+        knn_dists = torch.cdist(m_star, self.memory_bank, p=2.0)        # L2 norm dist btw m_star with each patch of memory bank
+        _, nn_idxs = knn_dists.topk(k=self.k_nearest, largest=False)    # Values and indexes of the k smallest elements of knn_dists
+
+        # Compute image-level anomaly score s
+        m_star_neighbourhood = self.memory_bank[nn_idxs[0, 1:]] # How far your anomalous patch is from each patch in the neighborhood
+        w_denominator = torch.linalg.norm(m_test_star - m_star_neighbourhood, dim=1)    # Sum over the exp of l2 norm distances btw m_test_star and the m* neighbourhood
+        norm = torch.sqrt(torch.tensor(patch_collection.shape[1]))                                 # Softmax normalization trick to prevent exp(norm) from becoming infinite
+        w = 1 - (torch.exp(s_star / norm) / torch.sum(torch.exp(w_denominator / norm))) # Equation 7 from the paper
+        s = w * s_star
+
+        # Segmentation map
+        fmap_size = feature_maps[0].shape[-2:]          # Feature map sizes: h, w
+        segm_map = dist_score.view(1, 1, *fmap_size)    # Reshape distance scores tensor, (1, 1, h, w)
+        segm_map = bilinear_upsample(segm_map, (self.image_size, self.image_size))  # Upsample to original image size
+        segm_map = gaussian_blur(segm_map)              # Gaussian blur of kernel width = 4
+
+        return s, segm_map
 
 
 def local_neighborhood_aggregation(feature_map, p=3):
@@ -270,8 +346,8 @@ def coreset_subsampling(embeddings, target_samples, epsilon=0.1, device=None, us
     # Step 1: Apply random projection if requested and beneficial
     if use_projection and C > 10:  # Only project if dimension is substantial
         # Calculate target projection dimension
-        d_star = calculate_projection_dim(n_samples, C, epsilon)
-        # d_star = 128
+        # d_star = calculate_projection_dim(n_samples, C, epsilon)
+        d_star = 128
         
         # Apply projection if it reduces dimension
         if d_star < C:
@@ -306,8 +382,87 @@ def coreset_subsampling(embeddings, target_samples, epsilon=0.1, device=None, us
     
     return selected_embeddings, selected_indices
 
+def gaussian_blur(img: tensor) -> tensor:
+    """
+        Apply a gaussian smoothing with sigma = 4 over the input image.
+    """
+    # Setup
+    blur_kernel = ImageFilter.GaussianBlur(radius=4)
+    tensor_to_pil = transforms.ToPILImage()
+    pil_to_tensor = transforms.ToTensor()
+
+    # Smoothing
+    max_value = img.max()   # Maximum value of all elements in the image tensor
+    blurred_pil = tensor_to_pil(img[0] / max_value).filter(blur_kernel)
+    blurred_map = pil_to_tensor(blurred_pil) * max_value
+
+    return blurred_map
+
 if __name__ == '__main__':
-    print("Testing PatchCore model")
+    import time
+    from data.test_data import SimpleDataset
+
+    # Start overall timing
+    start_time_total = time.time()
+
+    test_data = SimpleDataset(num_samples=1)
+    test_loader = DataLoader(test_data, batch_size=1, shuffle=False)
+    
+    model = PatchCore()
+    for sample, _ in test_loader:
+        print(f"Sample shape: {sample.shape}")
+        print(len(model(sample)))
+
+        model.predict(sample)
+        break
+    
+    
+    # # Time the fitting process
+    # start_time_fit = time.time()
+    # model.fit(test_loader)
+    # fit_time = time.time() - start_time_fit
+    # print(f"Model fitting completed in {fit_time:.2f} seconds")
+    
+    # # Check memory bank after fitting
+    # if hasattr(model, 'memory_bank'):
+    #     print(f"Memory bank type: {type(model.memory_bank)}")
+    #     print(f"Memory bank shape: {model.memory_bank.shape}")
+        
+    #     # Verify memory bank contains valid data
+    #     print(f"Memory bank stats - Min: {model.memory_bank.min().item():.4f}, "
+    #         f"Max: {model.memory_bank.max().item():.4f}, "
+    #         f"Mean: {model.memory_bank.mean().item():.4f}")
+        
+    #     # Check for NaN values
+    #     nan_count = torch.isnan(model.memory_bank).sum().item()
+    #     print(f"NaN values in memory bank: {nan_count}")
+    # else:
+    #     print("Memory bank not found!")
+    
+    # # Test on one sample
+    # start_time_inference = time.time()
+    # test_image = next(iter(test_loader))[0][0:1]  # Get first image
+
+    # # Reset features before extracting
+    # model.extracted_features = []
+
+    # # Forward pass
+    # features = model(test_image)
+    # inference_time = time.time() - start_time_inference
+    # print(f"Inference completed in {inference_time:.4f} seconds")
+    
+    # print(f"Number of extracted features: {len(features)}")
+    # print(f"Feature shapes: {[f.shape for f in features]}")
+    
+    # # Report total execution time
+    # total_time = time.time() - start_time_total
+    # print(f"Total execution time: {total_time:.2f} seconds")
+
+    # for sample, _ in test_loader:
+
+    #     model.predict(sample)
+    #     break
+
 
 
 
