@@ -4,8 +4,8 @@
 # 4 Evaluate PatchCore Model
 
 import logging
-import os
-import pickle # to be used with mvtec images
+import wandb
+import argparse
 from tqdm import tqdm
 
 import numpy as np
@@ -17,6 +17,10 @@ from torchvision.models import ResNet50_Weights
 from torch.utils.data import DataLoader, Subset
 
 from DiversitySampling.src.coreset import CoresetSampler
+from data.ksdd2 import KolektorSDD2
+from data.mvtec import MVTEC
+#from data.custom_dataset import CustomDataset
+
 from torchvision import transforms
 from PIL import ImageFilter
 from torch import tensor
@@ -27,7 +31,7 @@ LOGGER = logging.getLogger(__name__)
 class PatchCore(torch.nn.Module):
     def __init__(self):
         super(PatchCore, self).__init__()
-        self.device = "cuda" if torch.cuda.is_available() else "mps"
+        
         self.k_nearest = 3
         self.image_size = (224, 224)
         self.extracted_features = []
@@ -132,17 +136,19 @@ class PatchCore(torch.nn.Module):
         pixel_labels = []
 
         for sample, mask, label in tqdm(test_dataloader):
+            sample = sample.to(self.device)
+            mask = mask.to(self.device)
 
-            image_labels.append(label)
-            pixel_labels.extend(mask.flatten().numpy())
+            image_labels.append(label.numpy())
+            pixel_labels.extend(mask.flatten().cpu().numpy())
 
             score, segm_map = self.predict(sample)  # Anomaly Detection
 
-            image_preds.append(score.numpy())
-            pixel_preds.extend(segm_map.flatten().numpy())
+            image_preds.append(score.cpu().numpy())
+            pixel_preds.extend(segm_map.flatten().cpu().numpy())
 
-        image_labels = np.stack(image_labels)
-        image_preds = np.stack(image_preds)
+        image_labels = np.concatenate(image_labels)
+        image_preds = np.array(image_preds)
 
         # Compute ROC AUC for prediction scores
         image_level_rocauc = roc_auc_score(image_labels, image_preds)
@@ -398,85 +404,126 @@ def gaussian_blur(img: tensor) -> tensor:
 
     return blurred_map
 
+def main(args):
+    # Set the device.
+    device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    # Set the seed for reproducibility.
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    model = PatchCore().to(device)
+    
+    # Create transformations with proper resizing and center cropping
+    transform = transforms.Compose([
+        transforms.Resize(256),  # Resize the smaller edge to 256
+        transforms.CenterCrop(224),  # Center crop to 224x224
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])    
+
+    add_augmented = args.add_augmented
+    num_augmented = args.num_augmented
+    negative_only = args.negative_only
+    zero_shot = args.zero_shot
+    logging = args.logging
+
+    run_name = f'PatchCore-zero_shot_{zero_shot}-add_augmented_{add_augmented}-num_augmented_{num_augmented}-bs_{args.batch_size}-epochs_{args.epochs}'
+    tags = [f'{args.epochs}epochs', f'{num_augmented}augmented']
+    if args.zero_shot:
+        tags.append('zero_shot')
+    else:
+        tags.append('full_shot')
+    if args.add_augmented:
+        tags.append('augmented')
+    else:
+        tags.append('not_augmented')
+    
+    if logging:
+        # Start a new wandb run to track this script.
+        wandb.init(
+            name=run_name,
+            config=args,
+            tags=tags
+        )
+
+    # Dataset.
+    # Set up dataset based on the specified dataset name
+    if args.dataset == 'ksdd2':
+        print('Loading KolektorSDD2 training set...')
+        train_data = KolektorSDD2(dataroot=args.dataset_path, split='train',
+                                  negative_only=negative_only, 
+                                  add_augmented=add_augmented,
+                                  num_augmented=num_augmented, 
+                                  zero_shot=zero_shot)
+        
+        print('Loading KolektorSDD2 test set...')
+        test_data = KolektorSDD2(dataroot=args.dataset_path, split='test')
+    
+    elif args.dataset == 'mvtec':
+        print('Loading MVTec training set...')
+        train_data = MVTEC(dataroot=args.dataset_path,
+                           split='train',
+                           negative_only=negative_only,
+                           add_augmented=add_augmented,
+                           num_augmented=num_augmented,
+                           zero_shot=zero_shot)
+        
+        print('Loading MVTec test set...')
+        test_data = MVTEC(dataroot=args.dataset_path,
+                          split='test')
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
+
+    print(f'Training samples: {len(train_data)}')
+    print(f'Testing samples: {len(test_data)}')
+
+    # DataLoaders.
+    train_loader = DataLoader(train_data, batch_size=args.batch_size,
+                              shuffle=True, num_workers=args.num_workers, transform=transform)
+    test_loader = DataLoader(test_data, batch_size=args.batch_size,
+                             shuffle=False, num_workers=args.num_workers, transform=transform)
+
+
+    # PatchCore doesn't use traditional training with backpropagation
+    # Instead, it builds a memory bank from normal samples
+    print(f'Building PatchCore memory bank on {device} [...]')
+    
+    # Extract features and build memory bank
+    model.fit(train_loader)
+    
+    # Evaluate the model
+    print('Evaluating PatchCore model...')
+    image_auc, pixel_auc = model.evaluate(test_loader)
+    
+    print(f'Image-level AUC: {image_auc:.4f}')
+    print(f'Pixel-level AUC: {pixel_auc:.4f}')
+    
+    if logging:
+        wandb.log({
+            'image_auc': image_auc,
+            'pixel_auc': pixel_auc
+        })
+        wandb.finish()
+    print('PatchCore evaluation finished.')
+
 if __name__ == '__main__':
-    import time
-    from data.test_data import SimpleDataset
-
-    # Start overall timing
-    start_time_total = time.time()
-
-    test_data = SimpleDataset(num_samples=1)
-    test_loader = DataLoader(test_data, batch_size=1, shuffle=False)
+    parser = argparse.ArgumentParser(description='DIAG training')
+    parser.add_argument('--seed', type=int, default=1234)
+    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--dataset', type=str, choices=['ksdd2', 'mvtec'], default='ksdd2', help='Dataset to use for training (ksdd2 or mvtec)')
+    parser.add_argument('--dataset_path', type=str, required=True)
+    parser.add_argument('--negative_only', action='store_true', help='Train the model with only negative samples')
+    parser.add_argument('--add_augmented', action='store_true', help='Add augmented images to the training set')
+    parser.add_argument('--num_augmented', type=int, default=120)
+    parser.add_argument('--zero_shot', action='store_true', help='Train the model without true positives in the training set')
+    parser.add_argument('--logging', action='store_true', help='Log the stats to wandb')
     
-    model = PatchCore()
-    for sample, _ in test_loader:
-        print(f"Sample shape: {sample.shape}")
-        print(len(model(sample)))
 
-        model.predict(sample)
-        break
-    
-    
-    # # Time the fitting process
-    # start_time_fit = time.time()
-    # model.fit(test_loader)
-    # fit_time = time.time() - start_time_fit
-    # print(f"Model fitting completed in {fit_time:.2f} seconds")
-    
-    # # Check memory bank after fitting
-    # if hasattr(model, 'memory_bank'):
-    #     print(f"Memory bank type: {type(model.memory_bank)}")
-    #     print(f"Memory bank shape: {model.memory_bank.shape}")
-        
-    #     # Verify memory bank contains valid data
-    #     print(f"Memory bank stats - Min: {model.memory_bank.min().item():.4f}, "
-    #         f"Max: {model.memory_bank.max().item():.4f}, "
-    #         f"Mean: {model.memory_bank.mean().item():.4f}")
-        
-    #     # Check for NaN values
-    #     nan_count = torch.isnan(model.memory_bank).sum().item()
-    #     print(f"NaN values in memory bank: {nan_count}")
-    # else:
-    #     print("Memory bank not found!")
-    
-    # # Test on one sample
-    # start_time_inference = time.time()
-    # test_image = next(iter(test_loader))[0][0:1]  # Get first image
-
-    # # Reset features before extracting
-    # model.extracted_features = []
-
-    # # Forward pass
-    # features = model(test_image)
-    # inference_time = time.time() - start_time_inference
-    # print(f"Inference completed in {inference_time:.4f} seconds")
-    
-    # print(f"Number of extracted features: {len(features)}")
-    # print(f"Feature shapes: {[f.shape for f in features]}")
-    
-    # # Report total execution time
-    # total_time = time.time() - start_time_total
-    # print(f"Total execution time: {total_time:.2f} seconds")
-
-    # for sample, _ in test_loader:
-
-    #     model.predict(sample)
-    #     break
-
-
-
-
-
-
-# 1. we take a point (h,w) in the slice of the feature map
-# 2. we extract the neighborhood of the point
-# we average pool it to make it an aggregation of the neighborhood
-# This acts like local smoothing, combining the features within a patch (or neighborhood)
-# into one single vector of a fixed, predefined dimensionality d
-
-# as a result the overall resolution of the feature map is preserved
-# but resulting in a LOCALLY AWARE PATCH-FEATURE COLLECTION
-
-
+    args = parser.parse_args()
+    main(args)
 
 
