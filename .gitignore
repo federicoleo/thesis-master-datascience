@@ -200,3 +200,5 @@ aaa.py
 
 # KSDD2 data directory
 data/ksdd2/
+# MVTEC data directory
+data/mvtec_anomaly_detection/

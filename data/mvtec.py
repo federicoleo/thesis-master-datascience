@@ -54,7 +54,11 @@ class MVTecAD(Dataset):
             dataroot='/path/to/dataset/mvtec_anomaly_detection',
             category=None,
             split='train',
-            img_size=(224, 224)
+            img_size=(224, 224),
+            negative_only=False,
+            add_augmented=False,
+            num_augmented=0,
+            zero_shot=False
         ):
         super(MVTecAD, self).__init__()
 
@@ -62,6 +66,17 @@ class MVTecAD(Dataset):
         self.split = split
         self.img_size = img_size
         self.categories = [category] if category else self.CATEGORIES
+        self.negative_only = negative_only,
+        self.add_augmented = add_augmented,
+        self.num_augmented = num_augmented,
+        self.zero_shot = zero_shot
+
+        if self.add_augmented:
+            assert self.split == 'train', 'Augmented images are only for the training set!'
+        
+        if self.zero_shot:
+            assert self.add_augmented, 'Zero-shot learning requires augmented images!'
+            assert self.split == 'train', 'Zero-shot learning is only for the training set!'
         
         self.class_to_idx = inverse_list(self.LABELS)
         self.transform = self.get_transform(img_size)
@@ -70,6 +85,11 @@ class MVTecAD(Dataset):
         # Load dataset
         self.samples = []  # Will store (image_path, mask_path, label)
         self.load_dataset()
+
+        # Filter samples if negative_only is True
+        if negative_only:
+            self.samples = [(img, mask, label) for img, mask, label in self.samples if label == 0]
+
     
     def load_dataset(self):
         """Load image paths and corresponding labels/masks"""
@@ -86,6 +106,23 @@ class MVTecAD(Dataset):
                         if img_name.endswith(('.png', '.jpg', '.jpeg')):
                             img_path = os.path.join(normal_dir, img_name)
                             self.samples.append((img_path, None, 0))  # Normal = 0, no mask
+                
+                # In MVTec, training set typically only has normal images,
+                # but add this logic for completeness
+                for defect_type in os.listdir(train_dir):
+                    if defect_type == 'good':
+                        continue  # Already processed
+                    
+                    defect_dir = os.path.join(train_dir, defect_type)
+                    if not os.path.isdir(defect_dir):
+                        continue
+                    
+                    for img_name in os.listdir(defect_dir):
+                        if img_name.endswith(('.png', '.jpg', '.jpeg')):
+                            img_path = os.path.join(defect_dir, img_name)
+                            # Anomalous sample
+                            self.samples.append((img_path, None, 1))  # Anomaly = 1
+
 
             elif self.split == 'test':
                 # Test set has both normal and anomalous images
@@ -109,18 +146,45 @@ class MVTecAD(Dataset):
                     if not os.path.isdir(defect_dir):
                         continue
                     
+                     # The corresponding mask directory for this defect type
+                    mask_dir = os.path.join(gt_dir, defect_type)
+                    
                     for img_name in os.listdir(defect_dir):
                         if img_name.endswith(('.png', '.jpg', '.jpeg')):
                             img_path = os.path.join(defect_dir, img_name)
                             
-                            # Find corresponding mask
-                            mask_dir = os.path.join(gt_dir, defect_type)
-                            mask_name = img_name.replace('.jpg', '_mask.png').replace('.jpeg', '_mask.png').replace('.png', '_mask.png')
+                            # Find corresponding mask - the name format is always 
+                            # filename_mask.png regardless of the original extension
+                            base_name = os.path.splitext(img_name)[0]  # Get filename without extension
+                            mask_name = f"{base_name}_mask.png"
                             mask_path = os.path.join(mask_dir, mask_name)
                             
                             if os.path.exists(mask_path):
                                 self.samples.append((img_path, mask_path, 1))  # Anomaly = 1
     
+    def process_samples(self):
+        """Process samples based on parameters (negative_only, zero_shot)"""
+        # Handle negative_only parameter - filter out positive samples
+        if self.negative_only:
+            self.samples = [(img, mask, label) for img, mask, label in self.samples if label == 0]
+        
+        # Handle zero_shot parameter - filter out real positive samples
+        if self.zero_shot and self.split == 'train':
+            self.samples = [(img, mask, label) for img, mask, label in self.samples if label == 0]
+        
+        # Handle augmented data
+        if self.add_augmented and self.split == 'train':
+            # Placeholder for augmented data loading
+            # This will be implemented in the future extension
+            augmented_dir = os.path.join(self.dataroot, 'augmented')
+            if self.num_augmented > 0:
+                augmented_dir = os.path.join(self.dataroot, f'augmented_{self.num_augmented}')
+            
+            # Once you implement augmentation, you'll need to add logic here
+            # to load and incorporate the augmented images into self.samples
+            pass
+    
+
     def __getitem__(self, index):
         img_path, mask_path, label = self.samples[index]
         
@@ -139,7 +203,7 @@ class MVTecAD(Dataset):
         if self.normalize is not None:
             img = self.normalize(img)
         
-        return img, label, mask
+        return img, mask, label
     
     def __len__(self):
         return len(self.samples)
