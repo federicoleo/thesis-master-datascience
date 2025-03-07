@@ -29,24 +29,25 @@ from sklearn.metrics import roc_auc_score
 LOGGER = logging.getLogger(__name__)
 
 class PatchCore(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, device='cuda', image_size=(224, 224)):
         super(PatchCore, self).__init__()
         
         self.k_nearest = 3
-        self.image_size = (224, 224)
-        self.extracted_features = []
-        self.memory_bank = []
+        self.image_size = image_size
+        self.device = device
+        self.alpha = 0.7 # weight for negative distance (far from normal)
+        self.beta = 0.3 # weight for positive distance (close to anomalous)
         
+        self.neg_memory_bank = None
+        self.pos_memory_bank = None
+        self.extracted_features = []
+        
+        self.model = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
 
         def hook(module, input, output): # module: layer, input: input to the layer, output: output of the layer
             self.extracted_features.append(output)
-    
-        self.model = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
-
         self.model.layer2[-1].register_forward_hook(hook)
         self.model.layer3[-1].register_forward_hook(hook)
-
-        # Disable gradient computation
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
@@ -54,71 +55,53 @@ class PatchCore(torch.nn.Module):
     def forward(self, sample):
             self.extracted_features = []
             _ = self.model(sample)
-
             return self.extracted_features
 
+    def fit(self, neg_dataloader : DataLoader, pos_dataloader : DataLoader):
+        """Build Negative and Positive Memory Banks from provided data."""
+        # Negative Memory Bank
+        neg_memory_items = []
+        for sample, _, _ in tqdm(neg_dataloader, desc="Building Negative Memory Bank"):
+            sample = sample.to(self.device)
+            features = self.process_features(sample)
+            neg_memory_items.extend(features)
+        self.neg_memory_bank = torch.cat(neg_memory_items, dim=0)
+        N, C, H, W = self.neg_memory_bank.shape
+        print(f"Negative Memory Bank: {N} samples of shape {C}x{H}x{W}")
 
-    def fit(self, dataloader : DataLoader):
-        
-        memory_items = []
+        # Positive Memory Bank
+        pos_memory_items = []
+        for sample, _, _ in tqdm(pos_dataloader, desc="Building Positive Memory Bank"):
+            sample = sample.to(self.device)
+            features = self.process_features(sample)
+            pos_memory_items.extend(features)
 
-        for sample, _ in tqdm(dataloader, total=len(dataloader)):
-            # Extract features for the current batch
-            self.extracted_features = []
-            _ = self.model(sample)
+        self.pos_memory_bank = torch.cat(pos_memory_items, dim=0)
+        N, C, H, W = self.pos_memory_bank.shape
+        print(f"Positive Memory Bank: {N} samples of shape {C}x{H}x{W}")
 
-            layer2_features = self.extracted_features[0] # Shape: [B, 512, H2, W2]
-            layer3_features = self.extracted_features[1] # Shape: [B, 1024, H3, W3]
+        # Coreset Subsampling
+        share = 0.01
+        neg_target = max(1000, int(N * H * W * share))
+        pos_target = max(1000, int(N * H * W * share))
 
-            layer2_processed = local_neighborhood_aggregation(layer2_features, p=3)
-            layer3_processed = local_neighborhood_aggregation(layer3_features, p=3)
-
-            # Upsample layer3 to match layer2's spatial dimensions
-            layer3_upsampled = bilinear_upsample(layer3_processed, 
-                                            target_size=layer2_processed.shape[2:])
-            
-            # Process each image in the batch
-            B = layer2_processed.shape[0]
-            for b in range(B):
-                # Concatenate features from both layers along channel dimension
-                combined = torch.cat([
-                    layer2_processed[b],  # [512, H2, W2]
-                    layer3_upsampled[b]   # [1024, H2, W2]
-                ], dim=0)  # Result: [1536, H2, W2]
-                
-                # Resize to target dimension
-                resized = bilinear_upsample(combined.unsqueeze(0), target_size=(28, 28)).squeeze(0)
-                
-                # Add to memory items collection
-                memory_items.append(resized.unsqueeze(0))
-
-
-        self.memory_bank = torch.cat(memory_items, dim=0)
-        # [num_samples, 1536, 28, 28]
-        
-        N, C, H, W = self.memory_bank.shape
-        print(f"Memory bank created with {N} samples of shape {C}x{H}x{W}")
-        
-
-        # Apply coreset sampling
-        share = 0.01  # Keep 1% of all patches (adjust based on your needs)
-        target_samples = max(1000, int(N * H * W * share))
-
-        selected_embeddings, selected_indices = coreset_subsampling(
-            embeddings=self.memory_bank,
-            target_samples=target_samples,
-            epsilon=0.1,
-            device=self.device,
-            use_projection=True
+        self.neg_memory_bank, neg_indices = coreset_subsampling(
+            self.neg_memory_bank, neg_target, epsilon=0.1, device=self.device
         )
+        self.pos_memory_bank, pos_indices = coreset_subsampling(
+            self.pos_memory_bank, pos_target, epsilon=0.1, device=self.device
+        )
+        print(f"Negative Memory Bank reduced to {len(neg_indices)} patch embeddings")
+        print(f"Positive Memory Bank reduced to {len(pos_indices)} patch embeddings")
 
-        self.memory_bank = selected_embeddings
-
-        print(f"Memory bank reduced from {N*H*W} to {len(selected_indices)} patch embeddings via coreset subsampling")
-
-        # Save memory bank to disk
-        # with open("memory_bank.pkl", "wb") as f:
-        #     pickle.dump(self.memory_bank, f)
+    def process_features (self, sample):
+        features = self(sample)
+        layer2 = local_neighborhood_aggregation(features[0], p=3)
+        layer3 = local_neighborhood_aggregation(features[1], p=3)
+        layer3 = bilinear_upsample(layer3, target_size=layer2.shape[2:])
+        combined = torch.cat([layer2, layer3], dim=1)  # [B, 1536, H, W]
+        resized = bilinear_upsample(combined, target_size=(28, 28))  # [B, 1536, 28, 28]
+        return [resized[b].unsqueeze(0) for b in range(resized.shape[0])]
 
     def evaluate(self, test_dataloader: DataLoader):
         """
@@ -135,7 +118,7 @@ class PatchCore(torch.nn.Module):
         pixel_preds = []
         pixel_labels = []
 
-        for sample, mask, label in tqdm(test_dataloader):
+        for sample, mask, label in tqdm(test_dataloader, desc="Evaluating"):
             sample = sample.to(self.device)
             mask = mask.to(self.device)
 
@@ -143,13 +126,11 @@ class PatchCore(torch.nn.Module):
             pixel_labels.extend(mask.flatten().cpu().numpy())
 
             score, segm_map = self.predict(sample)  # Anomaly Detection
-
             image_preds.append(score.cpu().numpy())
             pixel_preds.extend(segm_map.flatten().cpu().numpy())
 
         image_labels = np.concatenate(image_labels)
         image_preds = np.array(image_preds)
-
         # Compute ROC AUC for prediction scores
         image_level_rocauc = roc_auc_score(image_labels, image_preds)
         pixel_level_rocauc = roc_auc_score(pixel_labels, pixel_preds)
@@ -157,8 +138,7 @@ class PatchCore(torch.nn.Module):
         return image_level_rocauc, pixel_level_rocauc
 
     def predict(self, sample):
-        # Patch Extraction
-        
+        """Compute anomaly score using d_neg / d_pos."""
         # Get features through forward method
         feature_maps = self(sample)
         # Local Neighborhood Aggregation
@@ -166,37 +146,72 @@ class PatchCore(torch.nn.Module):
         # Matching Feature Dimensions
         feature_maps[1] = bilinear_upsample(feature_maps[1], target_size=feature_maps[0].shape[2:])
         # Concatenation and Resizing
-        patch_collection = torch.cat(feature_maps, dim=1)
-        patch_collection = patch_collection.reshape(patch_collection.shape[1], -1).T
+        patch_collection = torch.cat(feature_maps, dim=1) # [B, 1536, H, W]
+        patch_collection = patch_collection.reshape(patch_collection.shape[1], -1).T # [H*W, 1536]
+
+        # Calculate distances to both memory banks
+        neg_distances = torch.cdist(patch_collection, self.neg_memory_bank, p=2.0)
+        neg_dist_score, neg_dist_score_idx = torch.min(neg_distances, dim=1)
         
-        # Calculate distances
-        distances = torch.cdist(patch_collection, self.memory_bank, p=2.0) # Shape: (784, N_subsampled×28×28)
-        # Get the minimum distance for each patch
-        dist_score, dist_score_idx = torch.min(distances, dim=1) # minimum distance for each patch
-        s_idx = torch.argmax(dist_score) # index of the patch with the maximum distance
-        s_star = torch.max(dist_score) # maximum distance, RAW ANOMALY SCORE
+        pos_distances = torch.cdist(patch_collection, self.pos_memory_bank, p=2.0)
+        pos_dist_score, pos_dist_score_idx = torch.min(pos_distances, dim=1)
         
-        m_test_star = patch_collection[s_idx] # feature vector of the most anomalous patch, actual embedding of the most anomalous patch
-        m_star = self.memory_bank[dist_score_idx[s_idx]].unsqueeze(0) # embedding of the nearest neighbor of the most anomalous patch
-
-        # KNN
-        knn_dists = torch.cdist(m_star, self.memory_bank, p=2.0)        # L2 norm dist btw m_star with each patch of memory bank
-        _, nn_idxs = knn_dists.topk(k=self.k_nearest, largest=False)    # Values and indexes of the k smallest elements of knn_dists
-
-        # Compute image-level anomaly score s
-        m_star_neighbourhood = self.memory_bank[nn_idxs[0, 1:]] # How far your anomalous patch is from each patch in the neighborhood
-        w_denominator = torch.linalg.norm(m_test_star - m_star_neighbourhood, dim=1)    # Sum over the exp of l2 norm distances btw m_test_star and the m* neighbourhood
-        norm = torch.sqrt(torch.tensor(patch_collection.shape[1]))                                 # Softmax normalization trick to prevent exp(norm) from becoming infinite
-        w = 1 - (torch.exp(s_star / norm) / torch.sum(torch.exp(w_denominator / norm))) # Equation 7 from the paper
-        s = w * s_star
-
-        # Segmentation map
-        fmap_size = feature_maps[0].shape[-2:]          # Feature map sizes: h, w
-        segm_map = dist_score.view(1, 1, *fmap_size)    # Reshape distance scores tensor, (1, 1, h, w)
-        segm_map = bilinear_upsample(segm_map, (self.image_size, self.image_size))  # Upsample to original image size
-        segm_map = gaussian_blur(segm_map)              # Gaussian blur of kernel width = 4
-
-        return s, segm_map
+        # Calculate initial ratio score (with epsilon to avoid division by zero)
+        epsilon = 1e-6
+        ratio_score = neg_dist_score / (pos_dist_score + epsilon)
+        
+        # Find patch with highest ratio score
+        s_idx = torch.argmax(ratio_score)
+        s_star = ratio_score[s_idx]
+        
+        # Extract the most anomalous test patch
+        m_test_star = patch_collection[s_idx]
+        
+        # NEGATIVE MEMORY BANK WEIGHTING
+        # For negative weighting: HIGHER is better (far from normal)
+        m_neg_star = self.neg_memory_bank[neg_dist_score_idx[s_idx]].unsqueeze(0)
+        
+        # Find k-nearest neighbors in negative memory bank
+        knn_neg_dists = torch.cdist(m_neg_star, self.neg_memory_bank, p=2.0)
+        _, nn_neg_idxs = knn_neg_dists.topk(k=self.k_nearest, largest=False)
+        
+        m_neg_neighborhood = self.neg_memory_bank[nn_neg_idxs[0, 1:]]
+        w_neg_denominator = torch.linalg.norm(m_test_star - m_neg_neighborhood, dim=1)
+        
+        # Normalization factor
+        norm = torch.sqrt(torch.tensor(patch_collection.shape[1]))
+        
+        # Compute negative weight - KEEP as high distance is good
+        w_neg = 1 - (torch.exp(neg_dist_score[s_idx] / norm) / 
+                    torch.sum(torch.exp(w_neg_denominator / norm)))
+        
+        # POSITIVE MEMORY BANK WEIGHTING
+        # For positive weighting: LOWER is better (close to anomalies)
+        m_pos_star = self.pos_memory_bank[pos_dist_score_idx[s_idx]].unsqueeze(0)
+        
+        # Find k-nearest neighbors in positive memory bank
+        knn_pos_dists = torch.cdist(m_pos_star, self.pos_memory_bank, p=2.0)
+        _, nn_pos_idxs = knn_pos_dists.topk(k=self.k_nearest, largest=False)
+        
+        m_pos_neighborhood = self.pos_memory_bank[nn_pos_idxs[0, 1:]]
+        w_pos_denominator = torch.linalg.norm(m_test_star - m_pos_neighborhood, dim=1)
+        
+        # Compute positive weight - INVERT the formula since LOW distance is good
+        # The original formula gives low weight for low distance, we want the opposite
+        w_pos = (torch.exp(pos_dist_score[s_idx] / norm) / 
+                torch.sum(torch.exp(w_pos_denominator / norm)))
+        
+        # Final weighted anomaly score:
+        # Higher w_neg (far from normal) * Higher w_pos (close to anomalous) * Higher ratio
+        s_final = (self.alpha * w_neg + self.beta * w_pos) * s_star
+        
+        # Create segmentation map using the ratio scores
+        fmap_size = feature_maps[0].shape[-2:]
+        segm_map = ratio_score.view(1, 1, *fmap_size)
+        segm_map = bilinear_upsample(segm_map, (self.image_size, self.image_size))
+        segm_map = gaussian_blur(segm_map)
+        
+        return s_final, segm_map
 
 
 def local_neighborhood_aggregation(feature_map, p=3):
@@ -415,14 +430,6 @@ def main(args):
 
     model = PatchCore().to(device)
     
-    # Create transformations with proper resizing and center cropping
-    transform = transforms.Compose([
-        transforms.Resize(256),  # Resize the smaller edge to 256
-        transforms.CenterCrop(224),  # Center crop to 224x224
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])    
-
     add_augmented = args.add_augmented
     num_augmented = args.num_augmented
     negative_only = args.negative_only
@@ -481,9 +488,9 @@ def main(args):
 
     # DataLoaders.
     train_loader = DataLoader(train_data, batch_size=args.batch_size,
-                              shuffle=True, num_workers=args.num_workers, transform=transform)
+                              shuffle=True, num_workers=args.num_workers)
     test_loader = DataLoader(test_data, batch_size=args.batch_size,
-                             shuffle=False, num_workers=args.num_workers, transform=transform)
+                             shuffle=False, num_workers=args.num_workers)
 
 
     # PatchCore doesn't use traditional training with backpropagation
