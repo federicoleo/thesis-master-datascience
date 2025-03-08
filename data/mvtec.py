@@ -36,13 +36,14 @@ class MVTecAD(Dataset):
             add_augmented=False,
             num_augmented=0,
             zero_shot=False,
-            memory_bank_type='negative'  # 'negative', 'positive', 'test'
+            memory_bank_type='negative',  # 'negative', 'positive', 'test'
+            transform=None
         ):
         super(MVTecAD, self).__init__()
         self.dataroot = dataroot
         self.split = split
         self.categories = [category] if category else self.CATEGORIES
-        self.output_size = (256, 256)
+        # self.output_size = (256, 256)
         self.negative_only = negative_only
         self.add_augmented = add_augmented
         self.num_augmented = num_augmented
@@ -64,7 +65,8 @@ class MVTecAD(Dataset):
 
         self.class_to_idx = inverse_list(self.LABELS)
         self.classes = self.LABELS
-        self.transform = self.get_transform(self.output_size)
+        # self.transform = self.get_transform(self.output_size)
+        self.transform = transform
         self.normalize = T.Normalize(self.MEAN, self.STD)
         
         self.samples = None
@@ -126,8 +128,8 @@ class MVTecAD(Dataset):
                     img_files = [f for f in os.listdir(defect_dir) if f.endswith(".png") and not f.endswith("_GT.png")]
                     N += len(img_files)
 
-        self.samples = torch.Tensor(N, 3, *self.output_size).zero_()
-        self.masks = torch.LongTensor(N, *self.output_size).zero_()
+        self.samples = torch.zeros(N, 3, 224, 224)
+        self.masks = torch.zeros(N, 224, 224, dtype=torch.long)
         self.product_ids = []
         idx = 0
 
@@ -148,7 +150,7 @@ class MVTecAD(Dataset):
                             mask_path = os.path.join(defect_dir, f"{product_id}_GT.png")
                             img = self.transform(Image.open(img_path))
                             mask = self.transform(Image.open(mask_path).convert('L'))
-                            mask = (mask * 255).long().squeeze(0)
+                            mask = (mask * 255).long().squeeze(0) # [224, 224]
                             if not self.negative_only or mask.sum() == 0:
                                 self.samples[idx] = img
                                 self.masks[idx] = mask
@@ -211,10 +213,6 @@ class MVTecAD(Dataset):
 
     def __len__(self):
         return self.N
-
-    @staticmethod
-    def get_transform(output_size):
-        return T.Compose([T.Resize(output_size), T.ToTensor()])
 
     @staticmethod
     def denorm(x):

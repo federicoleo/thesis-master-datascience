@@ -17,9 +17,8 @@ from torchvision.models import ResNet50_Weights
 from torch.utils.data import DataLoader, Subset
 
 from DiversitySampling.src.coreset import CoresetSampler
-from data.ksdd2 import KolektorSDD2
-from data.mvtec import MVTEC
-#from data.custom_dataset import CustomDataset
+# from data.ksdd2 import KolektorSDD2
+from data.mvtec import MVTecAD
 
 from torchvision import transforms
 from PIL import ImageFilter
@@ -29,7 +28,7 @@ from sklearn.metrics import roc_auc_score
 LOGGER = logging.getLogger(__name__)
 
 class PatchCore(torch.nn.Module):
-    def __init__(self, device='cuda', image_size=(224, 224)):
+    def __init__(self, device='cuda', image_size=224):
         super(PatchCore, self).__init__()
         
         self.k_nearest = 3
@@ -42,7 +41,7 @@ class PatchCore(torch.nn.Module):
         self.pos_memory_bank = None
         self.extracted_features = []
         
-        self.model = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
+        self.model = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1).to(device)
 
         def hook(module, input, output): # module: layer, input: input to the layer, output: output of the layer
             self.extracted_features.append(output)
@@ -427,22 +426,15 @@ def main(args):
     # Set the seed for reproducibility.
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-
-    model = PatchCore().to(device)
     
     add_augmented = args.add_augmented
     num_augmented = args.num_augmented
-    negative_only = args.negative_only
-    zero_shot = args.zero_shot
     logging = args.logging
 
-    run_name = f'PatchCore-zero_shot_{zero_shot}-add_augmented_{add_augmented}-num_augmented_{num_augmented}-bs_{args.batch_size}-epochs_{args.epochs}'
-    tags = [f'{args.epochs}epochs', f'{num_augmented}augmented']
-    if args.zero_shot:
-        tags.append('zero_shot')
-    else:
-        tags.append('full_shot')
-    if args.add_augmented:
+    run_name = f'PatchCore-add_augmented_{add_augmented}-num_augmented_{num_augmented}-bs_{args.batch_size}'
+    tags = [f'{num_augmented}augmented']
+
+    if add_augmented:
         tags.append('augmented')
     else:
         tags.append('not_augmented')
@@ -455,82 +447,86 @@ def main(args):
             tags=tags
         )
 
-    # Dataset.
-    # Set up dataset based on the specified dataset name
-    if args.dataset == 'ksdd2':
-        print('Loading KolektorSDD2 training set...')
-        train_data = KolektorSDD2(dataroot=args.dataset_path, split='train',
-                                  negative_only=negative_only, 
-                                  add_augmented=add_augmented,
-                                  num_augmented=num_augmented, 
-                                  zero_shot=zero_shot)
-        
-        print('Loading KolektorSDD2 test set...')
-        test_data = KolektorSDD2(dataroot=args.dataset_path, split='test')
-    
-    elif args.dataset == 'mvtec':
-        print('Loading MVTec training set...')
-        train_data = MVTEC(dataroot=args.dataset_path,
-                           split='train',
-                           negative_only=negative_only,
-                           add_augmented=add_augmented,
-                           num_augmented=num_augmented,
-                           zero_shot=zero_shot)
-        
-        print('Loading MVTec test set...')
-        test_data = MVTEC(dataroot=args.dataset_path,
-                          split='test')
-    else:
-        raise ValueError(f"Unknown dataset: {args.dataset}")
+    # Transform to match PatchCore official preprocessing
+    transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+    ])
 
-    print(f'Training samples: {len(train_data)}')
-    print(f'Testing samples: {len(test_data)}')
+    categories = MVTecAD.CATEGORIES
+    image_aucs = {}
+    pixel_aucs = {}
 
-    # DataLoaders.
-    train_loader = DataLoader(train_data, batch_size=args.batch_size,
-                              shuffle=True, num_workers=args.num_workers)
-    test_loader = DataLoader(test_data, batch_size=args.batch_size,
-                             shuffle=False, num_workers=args.num_workers)
+    for category in categories:
+        print(f"\nProcessing category: {category}")
+        neg_train_data = MVTecAD(
+            dataroot=args.dataset_path,
+            split='train',
+            category=category,
+            negative_only=True,
+            memory_bank_type='negative',
+            transform=transform
+        )
+        pos_train_data = MVTecAD(
+            dataroot=args.dataset_path,
+            split='train',
+            category=category,
+            add_augmented=add_augmented,
+            num_augmented=num_augmented,
+            memory_bank_type='positive',
+            transform=transform
+        )
+        test_data = MVTecAD(
+            dataroot=args.dataset_path,
+            split='test',
+            category=category,
+            memory_bank_type='test',
+            transform=transform
+        )
+        print(f"{category} - Neg: {len(neg_train_data)}, Pos: {len(pos_train_data)}, Test: {len(test_data)}")
 
+        neg_loader = DataLoader(neg_train_data, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+        pos_loader = DataLoader(pos_train_data, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+        test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    # PatchCore doesn't use traditional training with backpropagation
-    # Instead, it builds a memory bank from normal samples
-    print(f'Building PatchCore memory bank on {device} [...]')
-    
-    # Extract features and build memory bank
-    model.fit(train_loader)
-    
-    # Evaluate the model
-    print('Evaluating PatchCore model...')
-    image_auc, pixel_auc = model.evaluate(test_loader)
-    
-    print(f'Image-level AUC: {image_auc:.4f}')
-    print(f'Pixel-level AUC: {pixel_auc:.4f}')
-    
+        model = PatchCore(device=device, image_size=224)
+        print(f"Building memory banks for {category} on {device} [...]")
+        model.fit(neg_loader, pos_loader)
+        print(f"Evaluating {category}...")
+        image_auc, pixel_auc = model.evaluate(test_loader)
+        image_aucs[category] = image_auc
+        pixel_aucs[category] = pixel_auc
+        print(f"{category} - Image AUC: {image_auc:.4f}, Pixel AUC: {pixel_auc:.4f}")
+
+    avg_image_auc = np.mean(list(image_aucs.values()))
+    avg_pixel_auc = np.mean(list(pixel_aucs.values()))
+    print(f"\nFinal Results:")
+    print(f"Average Image AUC: {avg_image_auc:.4f}")
+    print(f"Average Pixel AUC: {avg_pixel_auc:.4f}")
+
     if logging:
-        wandb.log({
-            'image_auc': image_auc,
-            'pixel_auc': pixel_auc
-        })
+        wandb.log({'avg_image_auc': avg_image_auc, 'avg_pixel_auc': avg_pixel_auc})
+        for category in categories:
+            wandb.log({f'{category}_image_auc': image_aucs[category], f'{category}_pixel_auc': pixel_aucs[category]})
         wandb.finish()
-    print('PatchCore evaluation finished.')
+
+    print("PatchCore evaluation finished.")
+
+    
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='DIAG training')
-    parser.add_argument('--seed', type=int, default=1234)
-    parser.add_argument('--epochs', type=int, default=30)
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--num_workers', type=int, default=8)
-    parser.add_argument('--dataset', type=str, choices=['ksdd2', 'mvtec'], default='ksdd2', help='Dataset to use for training (ksdd2 or mvtec)')
-    parser.add_argument('--dataset_path', type=str, required=True)
-    parser.add_argument('--negative_only', action='store_true', help='Train the model with only negative samples')
-    parser.add_argument('--add_augmented', action='store_true', help='Add augmented images to the training set')
-    parser.add_argument('--num_augmented', type=int, default=120)
-    parser.add_argument('--zero_shot', action='store_true', help='Train the model without true positives in the training set')
-    parser.add_argument('--logging', action='store_true', help='Log the stats to wandb')
-    
+    parser = argparse.ArgumentParser(description='PatchCore with Dual Memory Banks for MVTec')
+    parser.add_argument('--seed', type=int, default=1234, help='Random seed for reproducibility')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for DataLoaders')
+    parser.add_argument('--num_workers', type=int, default=8, help='Number of workers for DataLoaders')
+    parser.add_argument('--dataset', type=str, choices=['mvtec'], default='mvtec', help='Dataset to use (only mvtec supported)')
+    parser.add_argument('--dataset_path', type=str, required=True, help='Path to MVTec dataset')
+    parser.add_argument('--add_augmented', action='store_true', help='Add augmented images to Positive bank')
+    parser.add_argument('--num_augmented', type=int, default=150, help='Number of augmented images per category')
+    parser.add_argument('--logging', action='store_true', help='Log stats to wandb')
 
     args = parser.parse_args()
+    if args.dataset != 'mvtec':
+        raise ValueError("This implementation supports only 'mvtec' dataset for now.")
     main(args)
-
-

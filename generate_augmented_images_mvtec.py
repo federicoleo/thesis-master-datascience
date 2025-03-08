@@ -9,6 +9,7 @@ import random
 import numpy as np
 import argparse
 from glob import glob
+from PIL import Image
 
 # Category-specific prompts for MVTec defects
 CATEGORY_PROMPTS = {
@@ -44,19 +45,25 @@ def get_anomaly_masks(category_dir):
             mask_paths.extend(glob(os.path.join(category_dir, defect_type, "*_GT.png")))
     return mask_paths
 
+def threshold_mask(mask):
+    """Ensure mask is binary (0 or 255) after resizing"""
+    mask_np = np.array(mask)
+    mask_np = (mask_np > 127).astype(np.uint8) * 255
+    return Image.fromarray(mask_np)
+
 def main(args):
     ### ARGUMENTS
     src_dir = args.src_dir  # Root directory of MVTec dataset (e.g., "data/mvtec_preprocessed")
     imgs_per_prompt = args.imgs_per_prompt  # Number of images per prompt per category
     seed = args.seed
 
-    # Hyperparameters from your script
+    # Hyperparameters
     num_inference_steps = 30
     guidance_scale = 20.0
     strength = 0.99
     padding_mask_crop = 2
-    RES = (256, 256)  # Final resolution for MVTecAD
-    TARGET = (1024, 1024)  # Inpainting resolution to overcome SDXL shape bias
+    RES = (256, 256)  # Stored as 256x256 for MVTecAD compatibility, cropped to 224x224 later
+    TARGET = (1024, 1024)  # Inpainting resolution for SDXL quality
 
     ### MAIN
     # Device setup
@@ -138,6 +145,7 @@ def main(args):
                 # Resize to MVTecAD resolution
                 out_image = out_image.resize(RES)
                 mask = mask.resize(RES)
+                mask = threshold_mask(mask) # Ensure 0/255 binary mask
 
                 # Save with MVTecAD-compatible naming
                 out_img_path = os.path.join(dst_dir, "imgs", f"{img_idx:05d}.png")
