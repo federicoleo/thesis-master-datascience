@@ -122,13 +122,13 @@ class PatchCore(torch.nn.Module):
             mask = mask.to(self.device)
 
             image_labels.append(label.numpy())
-            pixel_labels.extend(mask.flatten().cpu().numpy())
+            pixel_labels.extend((mask.flatten().cpu().numpy() > 0).astype(np.uint8))
 
             score, segm_map = self.predict(sample)  # Anomaly Detection
             image_preds.append(score.cpu().numpy())
             pixel_preds.extend(segm_map.flatten().cpu().numpy())
 
-        image_labels = np.concatenate(image_labels)
+        image_labels = np.array(image_labels)
         image_preds = np.array(image_preds)
         # Compute ROC AUC for prediction scores
         image_level_rocauc = roc_auc_score(image_labels, image_preds)
@@ -410,13 +410,12 @@ def gaussian_blur(img: tensor) -> tensor:
     blur_kernel = ImageFilter.GaussianBlur(radius=4)
     tensor_to_pil = transforms.ToPILImage()
     pil_to_tensor = transforms.ToTensor()
-
     # Smoothing
     max_value = img.max()   # Maximum value of all elements in the image tensor
     blurred_pil = tensor_to_pil(img[0] / max_value).filter(blur_kernel)
-    blurred_map = pil_to_tensor(blurred_pil) * max_value
+    blurred_map = pil_to_tensor(blurred_pil).to(img.device)
 
-    return blurred_map
+    return blurred_map * max_value
 
 def main(args):
     # Set the device.
@@ -488,7 +487,7 @@ def main(args):
 
         neg_loader = DataLoader(neg_train_data, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
         pos_loader = DataLoader(pos_train_data, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-        test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+        test_loader = DataLoader(test_data, batch_size=1, shuffle=False, num_workers=args.num_workers)
 
         model = PatchCore(device=device, image_size=224)
         print(f"Building memory banks for {category} on {device} [...]")

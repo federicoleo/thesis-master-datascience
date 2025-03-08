@@ -84,12 +84,12 @@ class PatchCoreSingleBank(torch.nn.Module):
             sample, mask = sample.to(self.device), mask.to(self.device)
             
             image_labels.append(label.numpy())
-            pixel_labels.extend(mask.flatten().cpu().numpy())
+            pixel_labels.extend((mask.flatten().cpu().numpy() > 0).astype(np.uint8))
             score, segm_map = self.predict(sample)
             image_preds.append(score.cpu().numpy())
             pixel_preds.extend(segm_map.flatten().cpu().numpy())
 
-        image_labels = np.concatenate(image_labels)
+        image_labels = np.array(image_labels)
         image_preds = np.array(image_preds)
         image_auc = roc_auc_score(image_labels, image_preds)
         pixel_auc = roc_auc_score(pixel_labels, pixel_preds)
@@ -172,12 +172,20 @@ def coreset_subsampling(embeddings, target_samples, epsilon=0.1, device=None, us
     selected_indices = sampler.sample(embeddings_for_sampling.cpu().numpy())
     return reshaped_embeddings[selected_indices], selected_indices
 
-def gaussian_blur(img):
+def gaussian_blur(img: tensor) -> tensor:
+    """
+        Apply a gaussian smoothing with sigma = 4 over the input image.
+    """
+    # Setup
+    blur_kernel = ImageFilter.GaussianBlur(radius=4)
     tensor_to_pil = transforms.ToPILImage()
     pil_to_tensor = transforms.ToTensor()
-    max_value = img.max()
-    blurred_pil = tensor_to_pil(img[0] / max_value).filter(ImageFilter.GaussianBlur(radius=4))
-    return pil_to_tensor(blurred_pil) * max_value
+    # Smoothing
+    max_value = img.max()   # Maximum value of all elements in the image tensor
+    blurred_pil = tensor_to_pil(img[0] / max_value).filter(blur_kernel)
+    blurred_map = pil_to_tensor(blurred_pil).to(img.device)
+
+    return blurred_map * max_value
 
 def main(args):
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
@@ -221,7 +229,7 @@ def main(args):
         print(f"{category} - Train: {len(train_data)}, Test: {len(test_data)}")
 
         train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-        test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+        test_loader = DataLoader(test_data, batch_size=1, shuffle=False, num_workers=args.num_workers)
 
         model = PatchCoreSingleBank(device=device, image_size=224)
         print(f"Building memory bank for {category} on {device} [...]")
@@ -249,7 +257,7 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PatchCore with Single Memory Bank for MVTec')
     parser.add_argument('--seed', type=int, default=1234, help='Random seed for reproducibility')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for DataLoaders')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for DataLoaders')
     parser.add_argument('--num_workers', type=int, default=8, help='Number of workers for DataLoaders')
     parser.add_argument('--dataset_path', type=str, required=True, help='Path to MVTec dataset')
     parser.add_argument('--logging', action='store_true', help='Log stats to wandb')
