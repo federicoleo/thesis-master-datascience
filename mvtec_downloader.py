@@ -95,5 +95,3 @@ if __name__ == "__main__":
         download_and_extract('mvtec_anomaly_detection', args.out_path, args.keep_archive)
     else:
         download_and_extract(args.category, args.out_path, args.keep_archive)
-
-

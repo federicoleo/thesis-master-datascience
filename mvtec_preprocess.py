@@ -143,10 +143,9 @@ def main(args):
 
 
 if __name__ == "__main__":
-    # parser = argparse.ArgumentParser(description="Preprocess MVTec Anomaly Detection dataset")
-    # parser.add_argument("--src_dir", type=str, required=True, help="Path to the MVTec dataset root")
-    # parser.add_argument("--dst_dir", type=str, required=True, help="Path to the destination directory")
-    # parser.add_argument("--categories", type=str, default=None, help="Comma-separated list of categories to process (default: all)")
-    # args = parser.parse_args()
-    # main(args)
-    make_csv("data/mvtec_preprocessed")
+    parser = argparse.ArgumentParser(description="Preprocess MVTec Anomaly Detection dataset")
+    parser.add_argument("--src_dir", type=str, required=True, help="Path to the MVTec dataset root")
+    parser.add_argument("--dst_dir", type=str, required=True, help="Path to the destination directory")
+    parser.add_argument("--categories", type=str, default=None, help="Comma-separated list of categories to process (default: all)")
+    args = parser.parse_args()
+    main(args)

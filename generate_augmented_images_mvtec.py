@@ -56,6 +56,7 @@ def main(args):
     src_dir = args.src_dir  # Root directory of MVTec dataset (e.g., "data/mvtec_preprocessed")
     imgs_per_prompt = args.imgs_per_prompt  # Number of images per prompt per category
     seed = args.seed
+    categories_to_augment = args.categories
 
     # Hyperparameters
     num_inference_steps = 30
@@ -84,7 +85,12 @@ def main(args):
     ).to(device)
 
     # Process each category
-    categories = sorted(os.listdir(os.path.join(src_dir, "train")))
+    all_categories = sorted(os.listdir(os.path.join(src_dir, "train")))
+    if categories_to_augment:
+        categories = [c for c in categories_to_augment if c in all_categories]
+    else:
+        categories = all_categories
+
     for category in categories:
         print(f"\nProcessing category: {category}")
         
@@ -161,6 +167,8 @@ if __name__ == "__main__":
     parser.add_argument("--src_dir", type=str, required=True, help="Root directory of MVTec dataset (e.g., 'data/mvtec_preprocessed')")
     parser.add_argument("--imgs_per_prompt", type=int, default=50, help="Number of images to generate per prompt per category")
     parser.add_argument("--seed", type=int, default=0, help="Seed for random generation")
+    parser.add_argument("--categories", nargs="+", default=None, help="List of categories to augment (e.g., bottle cable)")
     args = parser.parse_args()
 
     main(args)
+
