@@ -1,0 +1,3 @@
+[submodule "DiversitySampling"]
+	path = DiversitySampling
+	url = https://github.com/NVIDIA/Diversity-Sampling.git
