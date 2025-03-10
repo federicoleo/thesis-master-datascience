@@ -213,6 +213,10 @@ data/ksdd2/
 data/ksdd2_preprocessed/
 
 # MVTec data directory
+data/mvtec_ad/
+data/mvtec
+data/bottle_preprocessed
+
 data/mvtec_anomaly_detection
 data/mvtec_preprocessed
 data/mvtec.py

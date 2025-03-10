@@ -13,25 +13,41 @@ from PIL import Image
 
 # Category-specific prompts for MVTec defects
 CATEGORY_PROMPTS = {
-    "bottle": ["cracks on glass surface", "dents on bottle", "scratches on cap"],
-    "cable": ["scratches on copper wire", "frayed insulation", "burn marks"],
-    "capsule": ["punctures on pill surface", "discoloration spots", "cracks on coating"],
-    "carpet": ["stains on fabric", "burn marks", "tears in weave"],
-    "grid": ["bent metal bars", "rust spots", "broken grid lines"],
-    "hazelnut": ["cracks on nut shell", "dark mold spots", "scratches on surface"],
-    "leather": ["scratches on leather", "stains on surface", "tears in material"],
-    "metal_nut": ["scratches on metal", "dents on nut", "rust patches"],
-    "pill": ["discoloration on pill", "cracks on surface", "puncture marks"],
-    "screw": ["scratches on metal", "bent screw thread", "rust on surface"],
-    "tile": ["cracks on ceramic", "stains on tile", "chipped edges"],
-    "toothbrush": ["bent bristles", "stains on handle", "broken bristle tips"],
-    "transistor": ["bent metal pins", "burn marks on chip", "scratches on surface"],
-    "wood": ["scratches on wood grain", "dark knots", "cracks in surface"],
-    "zipper": ["broken teeth", "scratches on metal", "frayed fabric edges"]
+    "bottle": ["glass crack", "contamination, foggy area"],
+    "cable": ["exposed wire", "bent cable", "missing wire", "damaged insulation"],
+    "capsule": ["crack on capsule", "deformed shape", "scratch on surface", "discoloration"],
+    "carpet": ["stain on fabric", "thread pull", "small hole", "color irregularity"],
+    "grid": ["bent grid section", "broken connection", "deformed pattern", "misalignment"],
+    "hazelnut": ["crack in shell", "mold spot", "puncture", "dark discoloration"],
+    "leather": ["scratch mark", "fold line", "small puncture", "stain patch"],
+    "metal_nut": ["surface scratch", "bent edge", "discoloration", "deformed shape"],
+    "pill": ["surface crack", "color spot", "imperfect imprint", "contamination"],
+    "screw": ["scratch on head", "damaged thread", "deformed shaft", "rough edge"],
+    "tile": ["hairline crack", "stain mark", "rough spot", "edge chip"],
+    "toothbrush": ["misaligned bristles", "damaged head", "bent bristles", "discoloration"],
+    "transistor": ["bent pin", "damaged casing", "misalignment", "broken lead"],
+    "wood": ["knot in grain", "scratch line", "discoloration", "small hole"],
+    "zipper": ["broken tooth", "misaligned teeth", "fabric damage", "bent track"]
 }
 
 # Generic negative prompt (can be made category-specific if needed)
-NEGATIVE_PROMPT = "smooth intact surface, clean, plain, uniform"
+NEGATIVE_PROMPTS = {
+    "bottle": "completely black image, abstract pattern, completely broken, unrealistic",
+    "cable": "intact insulation, properly aligned, complete wires, undamaged coating",
+    "capsule": "smooth surface, perfect shape, uniform color, clear imprint",
+    "carpet": "uniform texture, even color, intact fibers, consistent pattern",
+    "grid": "straight lines, intact connections, uniform pattern, undamaged structure",
+    "hazelnut": "smooth shell, even color, intact surface, natural appearance",
+    "leather": "smooth texture, even color, unblemished surface, uniform appearance",
+    "metal_nut": "smooth surface, straight edges, uniform color, perfect shape",
+    "pill": "smooth surface, clear imprint, uniform color, perfect shape",
+    "screw": "smooth threads, unblemished head, straight shaft, uniform finish",
+    "tile": "smooth surface, even color, perfect edges, uniform texture",
+    "toothbrush": "aligned bristles, uniform head, complete pattern, symmetrical shape",
+    "transistor": "straight pins, intact case, correct alignment, undamaged leads",
+    "wood": "smooth grain, even color, natural texture, unblemished surface",
+    "zipper": "aligned teeth, intact track, smooth edge, uniform spacing"
+}
 
 def get_normal_images(category_dir):
     """Get list of normal (good) images for a category."""
@@ -41,7 +57,7 @@ def get_anomaly_masks(category_dir):
     """Get list of anomaly masks from test split, excluding 'good'."""
     mask_paths = []
     for defect_type in os.listdir(category_dir):
-        if defect_type != "good":  # Exclude normal samples
+        if defect_type != "good" and defect_type != "contamination":  # Exclude normal samples
             mask_paths.extend(glob(os.path.join(category_dir, defect_type, "*_GT.png")))
     return mask_paths
 
@@ -59,10 +75,10 @@ def main(args):
     categories_to_augment = args.categories
 
     # Hyperparameters
-    num_inference_steps = 30
+    num_inference_steps = 40
     guidance_scale = 20.0
-    strength = 0.99
-    padding_mask_crop = 2
+    strength = 0.85
+    padding_mask_crop = 0
     RES = (256, 256)  # Stored as 256x256 for MVTecAD compatibility, cropped to 224x224 later
     TARGET = (1024, 1024)  # Inpainting resolution for SDXL quality
 
@@ -134,7 +150,7 @@ def main(args):
                 # Inpaint
                 out_image = pipe(
                     prompt=prompt,
-                    negative_prompt=NEGATIVE_PROMPT,
+                    negative_prompt=NEGATIVE_PROMPTS.get(category),
                     image=neg_img,
                     mask_image=mask,
                     guidance_scale=guidance_scale,
