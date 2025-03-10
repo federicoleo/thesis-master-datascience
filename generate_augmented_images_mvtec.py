@@ -17,9 +17,9 @@ import re
 # Define defect-specific prompts for each category and defect type
 DEFECT_TYPE_PROMPTS = {
     "bottle": {
-        "broken_large": ["large crack in glass", "broken glass rim", "shattered bottle edge"],
-        "broken_small": ["small glass chip", "tiny crack on surface", "minor glass damage"],
-        "contamination": ["contamination spot", "dirt on surface", "foreign material"]
+        "broken_large": ["jagged crack along rim, sharp fracture lines, reflective broken edges, irregular glass fragments"],
+        "broken_small": ["small chip on rim, tiny fracture lines, localized damage, subtle glass break"],
+        "contamination": ["floating debris, semi-transparent foreign material, irregular shaped contamination, suspended particle"]
     },
     "cable": {
         "bent_wire": ["bent copper wire", "deformed cable", "warped wire"],
@@ -73,8 +73,10 @@ NEGATIVE_PROMPTS = {
 }
 
 def get_normal_images(category_dir):
-    """Get list of normal (good) images for a category."""
-    return glob(os.path.join(category_dir, "good", "*.png"))
+    """Get list of normal (good) images for a category, excluding GT mask files."""
+    all_files = glob(os.path.join(category_dir, "good", "*.png"))
+    # Filter out any file that ends with _GT.png
+    return [f for f in all_files if not f.endswith("_GT.png")]
 
 def get_anomaly_masks_by_defect(category_dir):
     """Get dictionary of anomaly masks organized by defect type."""
@@ -280,7 +282,7 @@ def main(args):
                         # strength=0.99 will replace the masked area entirely
                         # strength=0.0 would keep the original image
                         # We use a lower strength to ensure we're keeping most of the normal image
-                        inpaint_strength = 0.6
+                        inpaint_strength = 0.99
                         
                         # Debug info
                         if debug_mode:
@@ -344,7 +346,7 @@ if __name__ == "__main__":
     parser.add_argument("--categories", nargs="+", default=None, help="List of categories to process")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode with visualizations")
     parser.add_argument("--steps", type=int, default=30, help="Number of inference steps")
-    parser.add_argument("--guidance_scale", type=float, default=12.0, help="Guidance scale (7.5-15.0 work well)")
+    parser.add_argument("--guidance_scale", type=float, default=20.0, help="Guidance scale (7.5-15.0 work well)")
     
     args = parser.parse_args()
     main(args)
