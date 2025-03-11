@@ -98,7 +98,7 @@ def main(args):
             out_img_path = f'{dst_dir}/imgs/{str(img_idx + cnt).zfill(5)}.png'
             out_image.save(out_img_path)
             # save the mask with progressive name
-            out_mask_path = f'{dst_dir}/masks/{str(img_idx + cnt).zfill(5)}.png'
+            out_mask_path = f'{dst_dir}/imgs/{str(img_idx + cnt).zfill(5)}_GT.png'
             mask.save(out_mask_path)
             cnt += 1
         img_idx += cnt

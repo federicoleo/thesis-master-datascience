@@ -95,7 +95,7 @@ class KolektorSDD2(Dataset):
 
         if self.split == 'test':
             N = 1004
-        elif self.split == 'train' and self.zero_shot:
+        elif self.split == 'train' and self.negative_only:
             # only augmented positives and original negatives
             N = 2085 # number of original negatives
         else:
@@ -122,7 +122,7 @@ class KolektorSDD2(Dataset):
             img = self.transform(Image.open(path + img_name))
             lab = self.transform(
                 Image.open(path + product_id + '_GT.png').convert('L'))
-            if self.zero_shot:
+            if self.negative_only:
                 # check that the mask is negative
                 if lab.sum() == 0:
                     self.samples[cnt] = img

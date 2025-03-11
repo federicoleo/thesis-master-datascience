@@ -51,9 +51,7 @@ class MVTecAD(Dataset):
         self.memory_bank_type = memory_bank_type
 
         # Validation
-        if self.zero_shot:
-            assert self.add_augmented, 'Zero-shot learning requires augmented images!'
-            assert self.split == 'train', 'Zero-shot learning is only for the training set!'
+
         if self.memory_bank_type == 'positive':
             assert self.add_augmented, 'Positive memory bank requires augmented images!'
         if self.split == 'test':

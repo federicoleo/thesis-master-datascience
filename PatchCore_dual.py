@@ -34,8 +34,8 @@ class PatchCore(torch.nn.Module):
         self.k_nearest = 3
         self.image_size = image_size
         self.device = device
-        self.alpha = 0.7 # weight for negative distance (far from normal)
-        self.beta = 0.3 # weight for positive distance (close to anomalous)
+        self.alpha = 0.9 # weight for negative distance (far from normal)
+        self.beta = 0.1 # weight for positive distance (close to anomalous)
         
         self.neg_memory_bank = None
         self.pos_memory_bank = None
@@ -65,8 +65,8 @@ class PatchCore(torch.nn.Module):
             features = self.process_features(sample)
             neg_memory_items.extend(features)
         self.neg_memory_bank = torch.cat(neg_memory_items, dim=0)
-        N, C, H, W = self.neg_memory_bank.shape
-        print(f"Negative Memory Bank: {N} samples of shape {C}x{H}x{W}")
+        N_neg, C_neg, H_neg, W_neg = self.neg_memory_bank.shape
+        print(f"Negative Memory Bank: {N_neg} samples of shape {C_neg}x{H_neg}x{W_neg}")
 
         # Positive Memory Bank
         pos_memory_items = []
@@ -76,13 +76,13 @@ class PatchCore(torch.nn.Module):
             pos_memory_items.extend(features)
 
         self.pos_memory_bank = torch.cat(pos_memory_items, dim=0)
-        N, C, H, W = self.pos_memory_bank.shape
-        print(f"Positive Memory Bank: {N} samples of shape {C}x{H}x{W}")
+        N_pos, C_pos, H_pos, W_pos = self.pos_memory_bank.shape
+        print(f"Positive Memory Bank: {N_pos} samples of shape {C_pos}x{H_pos}x{W_pos}")
 
         # Coreset Subsampling
         share = 0.01
-        neg_target = max(1000, int(N * H * W * share))
-        pos_target = max(1000, int(N * H * W * share))
+        neg_target = max(1000, int(N_neg * H_neg * W_neg * share))
+        pos_target = max(1000, int(N_pos * H_pos * W_pos * share))
 
         self.neg_memory_bank, neg_indices = coreset_subsampling(
             self.neg_memory_bank, neg_target, epsilon=0.1, device=self.device
@@ -206,7 +206,7 @@ class PatchCore(torch.nn.Module):
         
         # Create segmentation map using the ratio scores
         fmap_size = feature_maps[0].shape[-2:]
-        segm_map = ratio_score.view(1, 1, *fmap_size)
+        segm_map = ratio_score.view(1, 1, *fmap_size) * (self.alpha * w_neg + self.beta * w_pos)
         segm_map = bilinear_upsample(segm_map, (self.image_size, self.image_size))
         segm_map = gaussian_blur(segm_map)
         
@@ -453,7 +453,7 @@ def main(args):
         transforms.ToTensor(),
     ])
 
-    categories = MVTecAD.CATEGORIES
+    categories = ['bottle']
     image_aucs = {}
     pixel_aucs = {}
 
@@ -471,7 +471,7 @@ def main(args):
             dataroot=args.dataset_path,
             split='train',
             category=category,
-            add_augmented=add_augmented,
+            add_augmented=True,
             num_augmented=num_augmented,
             memory_bank_type='positive',
             transform=transform
@@ -517,7 +517,7 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PatchCore with Dual Memory Banks for MVTec')
     parser.add_argument('--seed', type=int, default=1234, help='Random seed for reproducibility')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for DataLoaders')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for DataLoaders')
     parser.add_argument('--num_workers', type=int, default=8, help='Number of workers for DataLoaders')
     parser.add_argument('--dataset', type=str, choices=['mvtec'], default='mvtec', help='Dataset to use (only mvtec supported)')
     parser.add_argument('--dataset_path', type=str, required=True, help='Path to MVTec dataset')
@@ -529,3 +529,4 @@ if __name__ == '__main__':
     if args.dataset != 'mvtec':
         raise ValueError("This implementation supports only 'mvtec' dataset for now.")
     main(args)
+
