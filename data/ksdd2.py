@@ -57,7 +57,7 @@ class KolektorSDD2(Dataset):
         self.split_path = None
         self.split = 'train' if 'val' == split else split
 
-        self.output_size = (704, 256)
+        self.output_size = (352, 128)
         self.negative_only = negative_only
         self.add_augmented = add_augmented
         if self.add_augmented:
@@ -173,7 +173,7 @@ class KolektorSDD2(Dataset):
 
 
     @staticmethod
-    def get_transform(output_size=(704, 256)):
+    def get_transform(output_size=(352, 128)):
         transform = [
             T.Resize(output_size),
             T.ToTensor()

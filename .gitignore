@@ -219,6 +219,8 @@ data/bottle_preprocessed
 
 data/mvtec_anomaly_detection
 data/mvtec_preprocessed
+data/ksdd2_augmented_cropped
+data/ksdd2_positive_cropped
 data/mvtec.py
 data/mvtec_anomaly_detection/.DS_Store
 data/mvtec_anomaly_detection/license.txt

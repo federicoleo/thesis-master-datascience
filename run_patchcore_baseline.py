@@ -2,7 +2,8 @@ import argparse
 import os
 import torch
 import numpy as np
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
+import random
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score, precision_recall_curve, average_precision_score
 
@@ -14,7 +15,7 @@ def main():
     parser = argparse.ArgumentParser(description="Standard PatchCore Experiment")
     parser.add_argument("--dataset_path", type=str, required=True, help="Path to KSDD2 dataset")
     parser.add_argument("--output_dir", type=str, default="./results_standard", help="Directory to save results")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for training")
     parser.add_argument("--backbone", type=str, default="resnet50", 
                        choices=["resnet50", "wide_resnet50_2"], help="Backbone network")
     parser.add_argument("--subsampling", type=float, default=0.01, help="Memory bank subsampling rate")
@@ -43,6 +44,12 @@ def main():
         negative_only=True
     )
     
+    dataset_size = len(train_dataset)
+    subset_size = int(0.3 * dataset_size)
+    indices = random.sample(range(dataset_size), subset_size)
+
+    train_subset = Subset(train_dataset, indices)
+    
     # Test dataset
     test_dataset = KolektorSDD2(
         dataroot=args.dataset_path,
@@ -54,17 +61,17 @@ def main():
     
     # Create dataloaders
     train_loader = DataLoader(
-        train_dataset,
+        train_subset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4
+        num_workers=0
     )
     
     test_loader = DataLoader(
         test_dataset,
         batch_size=1,
         shuffle=False,
-        num_workers=4
+        num_workers=0
     )
     
     # Initialize and train PatchCore

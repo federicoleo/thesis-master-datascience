@@ -23,7 +23,8 @@ class KolektorSDD2Crops(Dataset):
                  crop_root,
                  transform=None,
                  add_augmented=False,
-                 augmented_crop_root=None):
+                 augmented_crop_root=None,
+                 output_size=(128,128)):
         """
         Args:
             crop_root (str): Directory containing pre-cropped defect images
@@ -32,6 +33,7 @@ class KolektorSDD2Crops(Dataset):
         self.crop_root = crop_root
         self.add_augmented = add_augmented
         self.augmented_crop_root = augmented_crop_root
+        self.output_size = output_size
 
         # Load original cropped defects
         self.crop_files = []
@@ -63,12 +65,15 @@ class KolektorSDD2Crops(Dataset):
     
     def __getitem__(self, idx):
         # Load crop and mask
-        crop_path = os.path.join(self.crop_root, self.crop_files[idx])
-        mask_path = os.path.join(self.crop_root, self.mask_files[idx])
+        crop_path = self.crop_files[idx]
+        mask_path = self.mask_files[idx]
         
         crop = Image.open(crop_path).convert('RGB')
         mask = Image.open(mask_path).convert('L')
         
+        crop = crop.resize(self.output_size, Image.BILINEAR)
+        mask = mask.resize(self.output_size, Image.NEAREST)
+
         # Apply transformations
         if self.transform:
             crop = self.transform(crop)

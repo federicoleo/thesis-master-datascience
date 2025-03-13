@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from DiversitySampling.src.coreset import CoresetSampler
 from torchvision import transforms
 from PIL import ImageFilter
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, precision_recall_curve, average_precision_score
 
 LOGGER = logging.getLogger(__name__)
 
@@ -115,13 +115,16 @@ class PatchCoreSingle(torch.nn.Module):
         
         # Apply local neighborhood aggregation to features
         layer2 = self.local_neighborhood_aggregation(features[0], p=3)
+        # print(f"DEBUG {layer2.shape}")
         layer3 = self.local_neighborhood_aggregation(features[1], p=3)
-        
+        # print(f"DEBUG {layer3.shape}")
         # Upsample layer3 to match layer2 dimensions
         layer3 = self.bilinear_upsample(layer3, target_size=layer2.shape[2:])
+        # print(f"DEBUG AFTER BILINEAR UPSAMPLING {layer3.shape}")
         
         # Concatenate features from both layers
         combined = torch.cat([layer2, layer3], dim=1)
+        # print(f"DEBUG AFTER COMBINATION {combined.shape}")
         
         # Return feature tensors for each image in batch
         return [combined[b].unsqueeze(0) for b in range(combined.shape[0])]
@@ -139,16 +142,21 @@ class PatchCoreSingle(torch.nn.Module):
             torch.Tensor: Anomaly segmentation map
         """
         # Extract features
-        feature_maps = self.process_features(sample)
+        feature_maps = self(sample)
+        # print(f"DEBUG AFTER TEST FEATURE EXTRACTION {len(feature_maps), feature_maps[0].shape, feature_maps[1].shape}")
         
         # Apply local neighborhood aggregation
         feature_maps = [self.local_neighborhood_aggregation(fm, p=3) for fm in feature_maps]
+        # print(f"DEBUG AFTER TEST FEATURE LOCAL NEG AGGREG: {feature_maps[0].shape, feature_maps[1].shape}")
         
         # Ensure consistent dimensions
         feature_maps[1] = self.bilinear_upsample(feature_maps[1], target_size=feature_maps[0].shape[2:])
+        # print(f"DEBUG AFTER feature 1 UPSAMPLING {feature_maps[1].shape}")
+
         
         # Concatenate features
         patch_collection = torch.cat(feature_maps, dim=1)
+        # print(f"DEBUG PATCH COLLECTION SHAPE {patch_collection.shape}")
 
         # Store original dimensions
         C, H, W = patch_collection.shape[1:]
@@ -339,7 +347,7 @@ class PatchCoreSingle(torch.nn.Module):
             torch.Tensor: Blurred tensor
         """
         # Create PIL transformations
-        blur_kernel = ImageFilter.GaussianBlur(radius=4)
+        blur_kernel = ImageFilter.GaussianBlur(radius=2)
         tensor_to_pil = transforms.ToPILImage()
         pil_to_tensor = transforms.ToTensor()
         
@@ -358,10 +366,15 @@ class PatchCoreDual:
     Dual PatchCore model that combines scores from negative and positive memory banks.
     The final anomaly score is the ratio of negative score to positive score.
     """
-    def __init__(self, device='cuda', backbone='wide_resnet50_2', negative_subsampling = 0.01, positive_subsampling = 0.10):
+    def __init__(self, device='cuda', backbone='wide_resnet50_2', negative_subsampling = 0.01, positive_subsampling = 0.10, scoring_method='weighted_linear'):
         self.negative_model = PatchCoreSingle(device, backbone, memory_type='negative', subsampling_share=negative_subsampling)
         self.positive_model = PatchCoreSingle(device, backbone, memory_type='positive', subsampling_share=positive_subsampling)
         self.device = device
+
+        self.neg_weight = 0.7
+        self.pos_weight = 0.3
+
+        self.scoring_method = scoring_method
     
     def fit(self, negative_dataloader, positive_dataloader):
         """Build both negative and positive memory banks."""
@@ -380,30 +393,38 @@ class PatchCoreDual:
         neg_score, neg_map = self.negative_model.get_anomaly_score(sample)
         pos_score, pos_map = self.positive_model.get_anomaly_score(sample)
         
-        # Calculate ratio (with small epsilon to avoid division by zero)
         epsilon = 1e-6
         
-        # Higher ratio means more anomalous:
-        # - Higher neg_score = farther from normal samples
-        # - Lower pos_score = closer to defective samples
-        ratio_score = neg_score / (pos_score + epsilon)
-        
-        # Create ratio map for segmentation
+        # Select scoring method based on configuration
+        if self.scoring_method == 'ratio':
+            # Original ratio method
+            final_score = neg_score / (pos_score + epsilon)
+            final_map = neg_map / (pos_map + epsilon)
+            
+        elif self.scoring_method == 'weighted_linear':
+            # Weighted linear combination
+            final_score = self.neg_weight * neg_score - self.pos_weight * pos_score
+            final_map = self.neg_weight * neg_map - self.pos_weight * pos_map
+            
+        elif self.scoring_method == 'weighted_ratio':
+            # Weighted ratio approach
+            final_score = (neg_score ** self.neg_weight) / ((pos_score ** self.pos_weight) + epsilon)
+            final_map = (neg_map ** self.neg_weight) / ((pos_map ** self.pos_weight) + epsilon)
+            
+            # Ensure final_map has the right shape
         H, W = neg_map.shape[2:]
-        neg_map_flat = neg_map.view(-1)
-        pos_map_flat = pos_map.view(-1)
-        ratio_map_flat = neg_map_flat / (pos_map_flat + epsilon)
-        ratio_map = ratio_map_flat.view(1, 1, H, W)
+        if isinstance(final_map, torch.Tensor) and final_map.dim() < 4:
+            final_map = final_map.view(1, 1, H, W)
         
         # Upsample to original image size
         original_size = (sample.shape[2], sample.shape[3])
-        segm_map = self.negative_model.bilinear_upsample(ratio_map, original_size)
+        segm_map = self.negative_model.bilinear_upsample(final_map, original_size)
         
         # Apply Gaussian blur
         segm_map = self.negative_model.gaussian_blur(segm_map)
         
-        return ratio_score, segm_map
-    
+        return final_score, segm_map
+        
     def evaluate(self, test_dataloader):
         """
         Evaluate the model on a test dataset.
@@ -435,8 +456,32 @@ class PatchCoreDual:
         # Calculate metrics
         image_auc = roc_auc_score(image_labels, image_preds)
         pixel_auc = roc_auc_score(pixel_labels, pixel_preds)
-        
-        return image_auc, pixel_auc
 
+        image_ap = average_precision_score(image_labels, image_preds)
+        pixel_ap = average_precision_score(pixel_labels, pixel_preds)
+
+        precisions, recalls, thresholds = precision_recall_curve(image_labels, image_preds)
+        f1_scores = 2 * precisions * recalls / (precisions + recalls + 1e-8)
+        best_idx = np.argmax(f1_scores)
+        best_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0
+        
+        return image_auc, pixel_auc, image_ap, pixel_ap, f1_scores, best_idx, best_threshold
+
+
+    def normalize_map(self, anomaly_map):
+        """
+        Normalize an anomaly map to the range [0, 1] using min-max normalization.
+        
+        Args:
+            anomaly_map (torch.Tensor): Anomaly map tensor.
+        
+        Returns:
+            normalized_map (torch.Tensor): Normalized anomaly map.
+        """
+        map_min = anomaly_map.min()
+        map_max = anomaly_map.max()
+        # Add small constant to avoid division by zero
+        normalized_map = (anomaly_map - map_min) / (map_max - map_min + 1e-8)
+        return normalized_map
 # FURTHER WORK:
 # add set subsampling rates method
