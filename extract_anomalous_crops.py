@@ -19,7 +19,7 @@ def reshape_image(image, target_size):
     """
     return cv2.resize(image, (target_size[1], target_size[0]), interpolation=cv2.INTER_LINEAR)
 
-def extract_anomalous_crops(train_dir: str, output_dir: str, csv_file: str = None, padding: int = 10, 
+def extract_anomalous_crops(train_dir: str, output_dir: str, csv_file: str = None, padding: int = 1, 
                              min_area: int = 16, reshape_size: tuple = None, mask_suffix: str = "_GT"):
     """
     Extract and save anomalous patches from samples based on their masks, with optional CSV filtering.
@@ -197,7 +197,7 @@ if __name__ == "__main__":
     parser.add_argument("--train_dir", type=str, required=True, help="Directory containing the images and masks.")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory where extracted patches will be saved.")
     parser.add_argument("--csv_file", type=str, default=None, help="Path to CSV file with 'path,label' columns. If provided, only samples labeled as 'positive' will be processed.")
-    parser.add_argument("--padding", type=int, default=15, help="Extra pixels around each defect (default: 10).")
+    parser.add_argument("--padding", type=int, default=1, help="Extra pixels around each defect (default: 10).")
     parser.add_argument("--min_area", type=int, default=1, help="Minimum patch dimension in pixels (default: 1).")
     parser.add_argument("--reshape", type=str, default=None, help="Reshape all output images to this size, format: 'HEIGHT,WIDTH' (e.g. '256,256')")
     parser.add_argument("--analyze", action="store_true", help="Analyze and display statistics about the extracted patches.")

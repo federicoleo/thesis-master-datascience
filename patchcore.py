@@ -49,6 +49,11 @@ class PatchCoreSingle(torch.nn.Module):
         else:
             raise ValueError(f"Unsupported backbone: {backbone}")
         
+        # Set model to evaluation mode and freeze parameters
+        self.model.eval()
+        for param in self.model.parameters():
+            param.requires_grad = False
+        
         # Register hooks to extract features
         def hook(module, input, output):
             self.extracted_features.append(output)
@@ -56,11 +61,7 @@ class PatchCoreSingle(torch.nn.Module):
         self.model.layer2[-1].register_forward_hook(hook)
         self.model.layer3[-1].register_forward_hook(hook)
         
-        # Set model to evaluation mode and freeze parameters
-        self.model.eval()
-        for param in self.model.parameters():
-            param.requires_grad = False
-
+        
     def forward(self, sample):
         """
         Extract features from the input image.
@@ -72,7 +73,9 @@ class PatchCoreSingle(torch.nn.Module):
             list: List of feature maps from different layers
         """
         self.extracted_features = []
-        _ = self.model(sample)
+        with torch.no_grad():
+            _ = self.model(sample)
+        
         return self.extracted_features
 
     def fit(self, dataloader: DataLoader):
@@ -86,48 +89,30 @@ class PatchCoreSingle(torch.nn.Module):
         
         for sample, _, _, _ in tqdm(dataloader, desc=f"Building {self.memory_type.capitalize()} Memory Bank"):
             sample = sample.to(self.device)
-            features = self.process_features(sample)
-            memory_items.extend(features)
+            features = self(sample)
+
+            self.avg = torch.nn.AvgPool2d(3, stride=1)
+            fmap_size_h = features[0].shape[-2]
+            fmap_size_w = features[0].shape[-1]
+
+            self.resize = torch.nn.AdaptiveAvgPool2d((fmap_size_h, fmap_size_w))
+            resized_maps = [self.resize(self.avg(fmap)) for fmap in features]
+
+            sample_patch_collection = torch.cat(resized_maps, dim=1)
+            sample_patch_collection = sample_patch_collection.reshape(sample_patch_collection.shape[1], -1).T
+            memory_items.append(sample_patch_collection)
             
-        self.memory_bank = torch.cat(memory_items, dim=0)
-        N, C, H, W = self.memory_bank.shape
-        print(f"Memory Bank: {N} samples of shape {C}x{H}x{W}")
+        self.memory_bank = torch.cat(memory_items, dim=0).to(self.device)
+        N, C = self.memory_bank.shape
+        print(f"Memory Bank: {N} patch embeddings collected with {C} dimensions")
 
         # Apply coreset subsampling to reduce memory bank size
-        target = max(1000, int(N * H * W * self.subsampling_share))
+        target = max(1000, int(N * self.subsampling_share))
         
         self.memory_bank, indices = self.coreset_subsampling(
             self.memory_bank, target, epsilon=0.1, device=self.device
         )
         print(f"Memory Bank reduced to {len(indices)} patch embeddings")
-
-    def process_features(self, sample):
-        """
-        Process features to create patch embeddings.
-        
-        Args:
-            sample (torch.Tensor): Input image tensor
-            
-        Returns:
-            list: List of processed feature tensors for each image in the batch
-        """
-        features = self(sample)
-        
-        # Apply local neighborhood aggregation to features
-        layer2 = self.local_neighborhood_aggregation(features[0], p=3)
-        # print(f"DEBUG {layer2.shape}")
-        layer3 = self.local_neighborhood_aggregation(features[1], p=3)
-        # print(f"DEBUG {layer3.shape}")
-        # Upsample layer3 to match layer2 dimensions
-        layer3 = self.bilinear_upsample(layer3, target_size=layer2.shape[2:])
-        # print(f"DEBUG AFTER BILINEAR UPSAMPLING {layer3.shape}")
-        
-        # Concatenate features from both layers
-        combined = torch.cat([layer2, layer3], dim=1)
-        # print(f"DEBUG AFTER COMBINATION {combined.shape}")
-        
-        # Return feature tensors for each image in batch
-        return [combined[b].unsqueeze(0) for b in range(combined.shape[0])]
 
     
     def get_anomaly_score(self, sample):
@@ -141,37 +126,27 @@ class PatchCoreSingle(torch.nn.Module):
             float: Anomaly score
             torch.Tensor: Anomaly segmentation map
         """
-        # Extract features
+         # Extract features
         feature_maps = self(sample)
-        # print(f"DEBUG AFTER TEST FEATURE EXTRACTION {len(feature_maps), feature_maps[0].shape, feature_maps[1].shape}")
-        
-        # Apply local neighborhood aggregation
-        feature_maps = [self.local_neighborhood_aggregation(fm, p=3) for fm in feature_maps]
-        # print(f"DEBUG AFTER TEST FEATURE LOCAL NEG AGGREG: {feature_maps[0].shape, feature_maps[1].shape}")
-        
-        # Ensure consistent dimensions
-        feature_maps[1] = self.bilinear_upsample(feature_maps[1], target_size=feature_maps[0].shape[2:])
-        # print(f"DEBUG AFTER feature 1 UPSAMPLING {feature_maps[1].shape}")
 
-        
-        # Concatenate features
-        patch_collection = torch.cat(feature_maps, dim=1)
-        # print(f"DEBUG PATCH COLLECTION SHAPE {patch_collection.shape}")
+        self.avg = torch.nn.AvgPool2d(3, stride=1)
+        fmap_size_h = feature_maps[0].shape[-2]
+        fmap_size_w = feature_maps[0].shape[-1]
 
-        # Store original dimensions
-        C, H, W = patch_collection.shape[1:]
-        
-        # Reshape for distance calculation
-        patch_collection = patch_collection.reshape(patch_collection.shape[1], -1).T
+        self.resize = torch.nn.AdaptiveAvgPool2d((fmap_size_h, fmap_size_w))
+        resized_maps = [self.resize(self.avg(fmap)) for fmap in feature_maps]
+
+        patch = torch.cat(resized_maps, dim=1)
+        patch = patch.reshape(patch.shape[1], -1).T
 
         # Calculate distances to memory bank
-        distances = torch.cdist(patch_collection, self.memory_bank, p=2.0)
+        distances = torch.cdist(patch, self.memory_bank, p=2.0)
         dist_score, dist_score_idx = torch.min(distances, dim=1)
         
         # Find the patch with maximum distance (most anomalous)
         s_idx = torch.argmax(dist_score)
         s_star = dist_score[s_idx]
-        m_test_star = patch_collection[s_idx]
+        m_test_star = patch[s_idx]
         
         # Calculate neighborhood-based weight
         m_star = self.memory_bank[dist_score_idx[s_idx]].unsqueeze(0)
@@ -180,7 +155,7 @@ class PatchCoreSingle(torch.nn.Module):
         m_neighborhood = self.memory_bank[nn_idxs[0, 1:]]
         
         w_denominator = torch.linalg.norm(m_test_star - m_neighborhood, dim=1)
-        norm = torch.sqrt(torch.tensor(patch_collection.shape[1], device=self.device))
+        norm = torch.sqrt(torch.tensor(patch.shape[1], device=self.device))
         
         # For negative bank, we want high weight when far from normal
         # For positive bank, we want high weight when close to defects (invert the formula)
@@ -193,7 +168,7 @@ class PatchCoreSingle(torch.nn.Module):
         s_final = w * s_star
         
         # Create distance map
-        dist_map = dist_score.view(1, 1, H, W)
+        dist_map = dist_score.view(1, 1, fmap_size_h, fmap_size_w)
         
         return s_final, dist_map
 
@@ -206,44 +181,49 @@ class PatchCoreSingle(torch.nn.Module):
         
         # Upsample to match input image size
         original_size = (sample.shape[2], sample.shape[3])
-        segm_map = self.bilinear_upsample(dist_map, original_size)
+        segm_map = torch.nn.functional.interpolate(dist_map,
+                                                   size = original_size,
+                                                   mode='bilinear')
         
         # Apply Gaussian blur for smoother visualization
         segm_map = self.gaussian_blur(segm_map)
         
         return score, segm_map
 
-    # Helper methods
-    def local_neighborhood_aggregation(self, feature_map, p=3):
+    def evaluate_single(self, test_dataloader):
         """
-        Perform local neighborhood aggregation on feature maps.
+        Evaluate the model on a test dataset for single memory bank case.
         
-        Args:
-            feature_map (torch.Tensor): Feature map of shape [B, C, H, W]
-            p (int): Size of neighborhood patch
-            
         Returns:
-            torch.Tensor: Aggregated feature map of same shape
+            float: Image-level AUROC
+            float: Pixel-level AUROC
         """
-        B, C, H, W = feature_map.shape
-        offset = p // 2
+        image_preds = []
+        image_labels = []
+        pixel_preds = []
+        pixel_labels = []
         
-        # Pad feature map
-        padded = F.pad(feature_map, (offset, offset, offset, offset), mode='reflect')
+        for sample, label, mask, _ in tqdm(test_dataloader, desc="Evaluating PatchCoreSingle"):
+            sample = sample.to(self.device)
+            mask = mask.to(self.device)
+            
+            # Store ground truth
+            image_labels.append(label.item())
+            pixel_labels.extend((mask.flatten().cpu().numpy() > 0).astype(np.uint8))
+            
+            # Get predictions
+            score, segm_map = self.predict(sample)
+            
+            # Store predictions
+            image_preds.append(score.cpu().numpy())
+            pixel_preds.extend(segm_map.flatten().cpu().numpy())
         
-        # Extract neighborhoods
-        neighborhoods = F.unfold(padded, kernel_size=p, stride=1)
+        # Calculate metrics
+        image_auc = roc_auc_score(image_labels, image_preds)
+        pixel_auc = roc_auc_score(pixel_labels, pixel_preds)
         
-        # Reshape for aggregation
-        neighborhoods = neighborhoods.view(B, C, p*p, H*W).permute(0, 3, 1, 2).reshape(B*H*W, C, p, p)
-        
-        # Apply average pooling
-        pooled = F.adaptive_avg_pool2d(neighborhoods, (1, 1))
-        
-        # Reshape back to original dimensions
-        result = pooled.reshape(B, H*W, C, 1).squeeze(-1).permute(0, 2, 1).reshape(B, C, H, W)
-        
-        return result
+        return image_auc, pixel_auc
+
 
     def bilinear_upsample(self, lower_spatial_block, target_size):
         """
@@ -281,33 +261,28 @@ class PatchCoreSingle(torch.nn.Module):
             
         # Reshape embeddings if needed
         original_shape = embeddings.shape
-        if len(original_shape) > 2:
-            N, C, H, W = embeddings.shape
-            reshaped_embeddings = embeddings.permute(0, 2, 3, 1).reshape(-1, C)
-        else:
-            reshaped_embeddings = embeddings
-            
-        n_samples, C = reshaped_embeddings.shape
+        
+        N, C = embeddings.shape
         
         # Apply random projection if beneficial
         if use_projection and C > 10:
             d_star = 128
             if d_star < C:
                 print(f"Projecting from {C} to {d_star} dimensions")
-                embeddings_for_sampling = self.random_projection(reshaped_embeddings, d_star, epsilon)
+                embeddings_for_sampling = self.random_projection(embeddings, d_star, epsilon)
             else:
-                embeddings_for_sampling = reshaped_embeddings
+                embeddings_for_sampling = embeddings
         else:
-            embeddings_for_sampling = reshaped_embeddings
+            embeddings_for_sampling = embeddings
             
         # Ensure we don't request more samples than available
-        target_samples = min(target_samples, n_samples)
+        target_samples = min(target_samples, N)
         
         # Use CoresetSampler for efficient subsampling
         sampler = CoresetSampler(n_samples=target_samples, device=str(device), tqdm_disable=False, verbose=1)
         selected_indices = sampler.sample(embeddings_for_sampling.cpu().numpy())
         
-        return reshaped_embeddings[selected_indices], selected_indices
+        return embeddings[selected_indices], selected_indices
 
     def random_projection(self, embeddings, target_dim, epsilon=0.1, seed=0):
         """
@@ -366,15 +341,10 @@ class PatchCoreDual:
     Dual PatchCore model that combines scores from negative and positive memory banks.
     The final anomaly score is the ratio of negative score to positive score.
     """
-    def __init__(self, device='cuda', backbone='wide_resnet50_2', negative_subsampling = 0.01, positive_subsampling = 0.10, scoring_method='weighted_linear'):
+    def __init__(self, device='cuda', backbone='wide_resnet50_2', negative_subsampling = 0.01, positive_subsampling = 0.10):
         self.negative_model = PatchCoreSingle(device, backbone, memory_type='negative', subsampling_share=negative_subsampling)
         self.positive_model = PatchCoreSingle(device, backbone, memory_type='positive', subsampling_share=positive_subsampling)
         self.device = device
-
-        self.neg_weight = 0.7
-        self.pos_weight = 0.3
-
-        self.scoring_method = scoring_method
     
     def fit(self, negative_dataloader, positive_dataloader):
         """Build both negative and positive memory banks."""
@@ -395,35 +365,26 @@ class PatchCoreDual:
         
         epsilon = 1e-6
         
-        # Select scoring method based on configuration
-        if self.scoring_method == 'ratio':
-            # Original ratio method
-            final_score = neg_score / (pos_score + epsilon)
-            final_map = neg_map / (pos_map + epsilon)
+        # Higher ratio means more anomalous:
+        # - Higher neg_score = farther from normal samples
+        # - Lower pos_score = closer to defective samples
+        ratio_score = neg_score / (pos_score + epsilon)
             
-        elif self.scoring_method == 'weighted_linear':
-            # Weighted linear combination
-            final_score = self.neg_weight * neg_score - self.pos_weight * pos_score
-            final_map = self.neg_weight * neg_map - self.pos_weight * pos_map
-            
-        elif self.scoring_method == 'weighted_ratio':
-            # Weighted ratio approach
-            final_score = (neg_score ** self.neg_weight) / ((pos_score ** self.pos_weight) + epsilon)
-            final_map = (neg_map ** self.neg_weight) / ((pos_map ** self.pos_weight) + epsilon)
-            
-            # Ensure final_map has the right shape
+        # Create ratio map for segmentation
         H, W = neg_map.shape[2:]
-        if isinstance(final_map, torch.Tensor) and final_map.dim() < 4:
-            final_map = final_map.view(1, 1, H, W)
+        neg_map_flat = neg_map.view(-1)
+        pos_map_flat = pos_map.view(-1)
+        ratio_map_flat = neg_map_flat / (pos_map_flat + epsilon)
+        ratio_map = ratio_map_flat.view(1, 1, H, W)
         
         # Upsample to original image size
         original_size = (sample.shape[2], sample.shape[3])
-        segm_map = self.negative_model.bilinear_upsample(final_map, original_size)
+        segm_map = self.negative_model.bilinear_upsample(ratio_map, original_size)
         
         # Apply Gaussian blur
         segm_map = self.negative_model.gaussian_blur(segm_map)
         
-        return final_score, segm_map
+        return ratio_score, segm_map
         
     def evaluate(self, test_dataloader):
         """
@@ -456,32 +417,5 @@ class PatchCoreDual:
         # Calculate metrics
         image_auc = roc_auc_score(image_labels, image_preds)
         pixel_auc = roc_auc_score(pixel_labels, pixel_preds)
-
-        image_ap = average_precision_score(image_labels, image_preds)
-        pixel_ap = average_precision_score(pixel_labels, pixel_preds)
-
-        precisions, recalls, thresholds = precision_recall_curve(image_labels, image_preds)
-        f1_scores = 2 * precisions * recalls / (precisions + recalls + 1e-8)
-        best_idx = np.argmax(f1_scores)
-        best_threshold = thresholds[best_idx] if best_idx < len(thresholds) else 0
         
-        return image_auc, pixel_auc, image_ap, pixel_ap, f1_scores, best_idx, best_threshold
-
-
-    def normalize_map(self, anomaly_map):
-        """
-        Normalize an anomaly map to the range [0, 1] using min-max normalization.
-        
-        Args:
-            anomaly_map (torch.Tensor): Anomaly map tensor.
-        
-        Returns:
-            normalized_map (torch.Tensor): Normalized anomaly map.
-        """
-        map_min = anomaly_map.min()
-        map_max = anomaly_map.max()
-        # Add small constant to avoid division by zero
-        normalized_map = (anomaly_map - map_min) / (map_max - map_min + 1e-8)
-        return normalized_map
-# FURTHER WORK:
-# add set subsampling rates method
+        return image_auc, pixel_auc

@@ -47,8 +47,8 @@ class KolektorSDD2(Dataset):
     def __init__(self,
                  dataroot='/path/to/dataset/'
                           'KolektorSDD2',
-                 split='train', negative_only=False,
-                 add_augmented=False, num_augmented=0, zero_shot=False):
+                 split='train', negative_only=False, positive_only=False,
+                 add_augmented=False, num_augmented=100, zero_shot=False):
         super(KolektorSDD2, self).__init__()
 
         self.fold = None
@@ -57,9 +57,11 @@ class KolektorSDD2(Dataset):
         self.split_path = None
         self.split = 'train' if 'val' == split else split
 
-        self.output_size = (352, 128)
+        self.output_size = (632//2, 224//2)
         self.negative_only = negative_only
+        self.positive_only = positive_only
         self.add_augmented = add_augmented
+        self.num_augmented = num_augmented
         if self.add_augmented:
             assert self.split == 'train', 'Augmented images are only for the training set!'
         self.num_augmented = num_augmented
@@ -76,6 +78,13 @@ class KolektorSDD2(Dataset):
         self.load_imgs()
         if negative_only:
             m = self.masks.sum(-1).sum(-1) == 0
+            self.samples = self.samples[m]
+            self.masks = self.masks[m]
+            self.product_ids = [pid for flag, pid in zip(m, self.product_ids)
+                                    if flag]
+        
+        if positive_only:
+            m = self.masks.sum(-1).sum(-1) > 0  # Mask sum > 0 means it has defects
             self.samples = self.samples[m]
             self.masks = self.masks[m]
             self.product_ids = [pid for flag, pid in zip(m, self.product_ids)
@@ -98,6 +107,8 @@ class KolektorSDD2(Dataset):
         elif self.split == 'train' and self.negative_only:
             # only augmented positives and original negatives
             N = 2085 # number of original negatives
+        elif self.split == 'train' and self.positive_only:
+            N = 246
         else:
             # all original data + augmented
             N = 2331 # number of original negatives and positives
@@ -129,6 +140,12 @@ class KolektorSDD2(Dataset):
                     self.masks[cnt] = lab
                     self.product_ids.append(product_id)
                     cnt += 1
+            elif self.positive_only:
+                if lab.sum() > 0:
+                    self.samples[cnt] = img
+                    self.masks[cnt] = lab
+                    self.product_ids.append(product_id)
+                    cnt += 1
             else:
                 # default
                 self.samples[cnt] = img
@@ -144,8 +161,9 @@ class KolektorSDD2(Dataset):
                 for img_name in image_list:
                     product_id = img_name[:-4]
                     img = self.transform(Image.open(os.path.join(augmented_imgs_path, img_name)))
+                    mask_name = product_id + "_GT.png"
                     lab = self.transform(
-                        Image.open(os.path.join(augmented_masks_path, img_name)).convert('L'))
+                        Image.open(os.path.join(augmented_masks_path, mask_name)).convert('L'))
                     self.samples[cnt] = img
                     self.masks[cnt] = lab
                     self.product_ids.append(product_id)
@@ -173,7 +191,7 @@ class KolektorSDD2(Dataset):
 
 
     @staticmethod
-    def get_transform(output_size=(352, 128)):
+    def get_transform(output_size=(632//2, 224//2)):
         transform = [
             T.Resize(output_size),
             T.ToTensor()
@@ -185,3 +203,20 @@ class KolektorSDD2(Dataset):
     @staticmethod
     def denorm(x):
         return x * c2chw(torch.Tensor(KolektorSDD2.std)) + c2chw(torch.Tensor(KolektorSDD2.mean))
+
+
+if __name__ == "__main__":
+    dataroot = "data/ksdd2_preprocessed"  # Change this to your dataset path
+
+    # Create negative-only dataset
+    # neg_dataset = KolektorSDD2(dataroot=dataroot, split='train', negative_only=True, add_augmented=False)
+    # print(f"Negative-only dataset shape: ({len(neg_dataset)}, 3, {neg_dataset.output_size[0]}, {neg_dataset.output_size[1]})")
+
+    # Create positive-only dataset with augmented images
+    pos_dataset = KolektorSDD2(dataroot=dataroot, split='train', positive_only=True, add_augmented=False)
+    print(f"Positive-only dataset shape: ({len(pos_dataset)}, 3, {pos_dataset.output_size[0]}, {pos_dataset.output_size[1]})")
+
+    sample, label, mask, _ = pos_dataset[0]
+
+    print(len(mask.shape))
+    print(mask.unsqueeze(0).unsqueeze(0).shape)

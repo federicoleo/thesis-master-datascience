@@ -204,9 +204,10 @@ data/aa_mvtec.py
 data/ksdd2.py
 
 ksdd2_downloader.py
-ksdd2_preprocess.py
+ksdd2_preprocess.pyw
 generate_augmented_images.py
 train_ResNet50.py
+data/mvtec.py
 
 # KSDD2 data directory
 data/ksdd2/
