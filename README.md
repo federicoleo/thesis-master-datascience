@@ -64,45 +64,39 @@ The project utilizes the **Kolektor Surface Defect Dataset 2 (KSDD2)**, which co
     ```
 2.  **Download Data**:
     ```bash
-    python ksdd2_downloader.py
+    python src/utils/ksdd2_downloader.py --out_path <path_to_save_ksdd2_dataset>
     ```
+    *(Example: `python src/utils/ksdd2_downloader.py --out_path ./data/KSDD2_original`)*
 3.  **Preprocess Data**:
     ```bash
-    python ksdd2_preprocess.py
+    python src/utils/ksdd2_preprocess.py --src_dir <path_to_raw_ksdd2_dataset> --dst_dir <path_to_save_preprocessed_data>
     ```
-    *(Ensure paths and parameters within the script are set correctly).*
+    *(Example: `python src/utils/ksdd2_preprocess.py --src_dir ./data/KSDD2_original --dst_dir ./data/ksdd2_preprocessed`)*
+    *(Ensure the source directory contains the KSDD2 dataset as downloaded, and the destination directory is where the processed files will be stored.)*
+
 4.  **(Optional) Generate Augmented Images**:
     ```bash
-    python generate_augmented_images.py --output_path <path_to_save_augmented_images>
+    python src/utils/generate_augmented_images.py --src_dir <path_to_preprocessed_data> --imgs_per_prompt <number>
     ```
-    *(Refer to the script for more detailed arguments on diffusion model configuration, number of images, etc.)*
-5.  **Run PatchCore Experiments**:
+    *(Example: `python src/utils/generate_augmented_images.py --src_dir ./data/ksdd2_preprocessed --imgs_per_prompt 50`)*
+    *(Refer to the script for more detailed arguments.)*
+5.  **(Optional) Extract Anomaly Crops (if not part of your preprocessing or for specific experiments)**:
     ```bash
-    python run_patchcore.py \
-        --dataset_path <path_to_ksdd2_dataset> \
-        --crops_path <path_to_pre_cropped_defects> \
+    python src/utils/extract_anomalous_crops.py --train_dir <path_to_preprocessed_data/train> --output_dir <path_to_save_crops> --csv_file <path_to_preprocessed_data/train.csv>
+    ```
+    *(Example: `python src/utils/extract_anomalous_crops.py --train_dir ./data/ksdd2_preprocessed/train --output_dir ./data/defect_crops --csv_file ./data/ksdd2_preprocessed/train.csv`)* 
+
+6.  **Run PatchCore Experiments**:
+    ```bash
+    python src/run_patchcore.py \
+        --dataset_path <path_to_preprocessed_data> \
+        --crops_path <path_to_extracted_or_augmented_defect_crops> \
         --output_dir ./results \
         --backbone resnet50 \ # or wide_resnet50_2
-        # --add_augmented \ # Uncomment to use augmented images
-        # --augmented_path <path_to_augmented_images> \ # Specify if using augmented images
+        # --add_augmented \ # Uncomment to use augmented images from the crops_path if they are there
+        # --augmented_path <path_if_augmented_are_separate_from_crops> \ # Usually crops_path will contain both original and augmented if used together
         --neg_subsampling 0.01 \
         --pos_subsampling 0.10 \
         --seed 42
     ```
-    Refer to `run_patchcore.py` for the full list of command-line arguments and their descriptions.
-
-## Key Features and Contributions
-
--   Implementation of both `PatchCoreSingle` and `PatchCoreDual`.
--   Integration with the KSDD2 dataset.
--   Ability to leverage pre-cropped defects for the positive memory bank.
--   Framework for incorporating diffusion-based data augmentation for defect synthesis.
--   Systematic evaluation of anomaly detection performance using image and pixel-level AUROC.
-
-## Future Work / Potential Enhancements
-
--   Explore different backbone architectures.
--   Investigate various coreset subsampling strategies.
--   Experiment with different diffusion models and augmentation techniques.
--   Extend to other anomaly detection datasets.
--   Optimize inference speed for real-time applications.
+    Refer to `src/run_patchcore.py` for the full list of command-line arguments and their descriptions.
