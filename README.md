@@ -18,7 +18,6 @@ This file contains the core logic for the PatchCore algorithm.
     -   For a given test sample, features are extracted and compared against the memory bank(s).
     -   An anomaly score is calculated based on the distance to the nearest neighbors in the feature space.
     -   For `PatchCoreDual`, the scores from both positive and negative banks are combined.
--   **Localization**: Generates anomaly maps to highlight defective regions in images.
 
 ### 2. Experiment Runner (`run_patchcore.py`)
 
